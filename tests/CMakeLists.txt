@@ -1,0 +1,6 @@
+if( DEBUG )
+    add_definitions( "-Wall -g" )
+endif()
+add_executable(traversal_dir traversal_dir.c)
+add_executable(traversal_by_index traversal_by_index.c)
+add_executable(traversal_readline traversal_readline.c)

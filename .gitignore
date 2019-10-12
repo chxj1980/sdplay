@@ -53,3 +53,7 @@ dkms.conf
 *.a
 *.swp
 *.swo
+*.cscope
+tags
+cscope*
+build
