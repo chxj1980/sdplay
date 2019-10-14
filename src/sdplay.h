@@ -8,6 +8,8 @@
 #ifndef _SDPLAY_H
 #define _SDPLAY_H
 
+#define ERR_FILE_EMPTY -2
+
 typedef struct {
 }segment_info_t;
 
