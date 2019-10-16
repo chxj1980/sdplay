@@ -17,6 +17,8 @@
  *      5.1 ts的存储
  * 6.一些之前gos的信令，比如sd卡格式化,获取设备状态等
  * 7.有些地方操作文件没有加锁
+ * 8.回放支持多通道
+ * 9.tutk信令部分
  * */
 
 #include <stdio.h>
@@ -27,6 +29,7 @@
 #include <assert.h>
 #include <sys/param.h>
 #include <sys/mount.h>
+#include <inttypes.h>
 #include "transfer.h"
 #include "md5.h"
 
@@ -44,11 +47,15 @@
 #define CALL_FUNC_AND_RETURN( func ) if( !(func) ) { LOGE("call "#func" error");return -1; }
 #define ASSERT assert
 #define INDEX_DB "tsindexdb"
+#define SEGMENT_DB_FILENAME "segmentdb"
 #define INDEX_DB_TMP "tsindexdb.tmp"
 #define LENGTH_PER_RECORD 64
 #define PKT_HDR_LEN 10
 #define SD_SPACE_THREHOLD (1024*1024)// 1M
 #define DELETE_TS_COUNT (1024) // each time sd full,delete 1024 ts
+#define TIME_IN_SEC_LEN (10)
+#define TIME_STR(t) #t
+#define TIME_FILL_ZERO_LEN "0"TIME_STR(TIME_IN_SEC_LEN)
 
 enum {
     FIND_START = 1,
@@ -60,6 +67,7 @@ typedef struct {
     const char *sd_mount_path;
     int ts_delete_count_when_full;
     pthread_mutex_t mutex;
+    pthread_mutex_t segment_db_mutex;
 } sdplay_info_t;
 
 static sdplay_info_t g_sdplay_info;
@@ -73,6 +81,7 @@ int sdp_init( const char *ts_path, const char *sd_mount_path )
     g_sdplay_info.sd_mount_path = strdup(sd_mount_path);
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
     pthread_mutex_init( &g_sdplay_info.mutex, NULL );
+    pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
 
     return 0;
 }
@@ -248,7 +257,7 @@ static int parse_one_record( char *record, int64_t *starttime, int64_t *endtime 
     ASSERT( starttime );
     ASSERT( endtime );
 
-    sscanf( record, "%"PRId64"-%"PRId64"", starttime, &endtime );
+    sscanf( record, "%"PRId64"-%"PRId64"", starttime, endtime );
 
     return 0;
 }
@@ -444,8 +453,64 @@ int sdp_send_ts_list(int64_t starttime, int64_t endtime)
     return 0;
 }
 
+static int get_segment_db_filename( char *out_filename, int buflen )
+{
+    ASSERT( out_filename );
+    ASSERT( g_sdplay_info.ts_path );
+
+    snprintf( out_filename, buflen, "%s/%s", g_sdplay_info.ts_path, SEGMENT_DB_FILENAME );
+    return 0;
+}
+
+int sdp_save_segment_info(int64_t starttime, int64_t endtime)
+{
+    FILE *fp = NULL;
+    char segment_db_file[256] = { 0 };
+    char line[SEGMENT_RECORD_LEN] = {0};
+
+    CALL_FUNC_AND_RETURN( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
+    pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
+    snprintf(line, sizeof(line), "%"TIME_IN_SEC_LEN PRId64"-%"TIME_IN_SEC_LEN PRId64"\n", starttime, endtime );
+    if ( (fp = fopen( segment_db_file, "a") ) == NULL ) {
+        LOGE("open file %s error", segment_db_file);
+        pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+        return -1;
+    }
+    fwrite(line, strlen(line), 1, fp);
+    fclsoe(fp);
+    pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+    return 0;
+}
+
 int sdp_send_segment_list(int64_t starttime, int64_t endtime)
 {
+    char segment_db_file[256] = { 0 };
+    FILE *fp = NULL;
+    int start_pos = 0, end_pos = 0, count = 0;
+    char *line = NULL;
+    size_t len = 0;
+
+    CALL_FUNC_AND_RETURN( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) );
+    pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
+    CALL_FUNC_AND_RETURN( find_location_in_db(segment_db_file, starttime, endtime, &start_pos, &end_pos) );
+    if ( ( fp = fopen(segment_db_file, "r") ) == NULL ) {
+        pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+        return -1;
+    }
+    for (i = 0; i < count; ++i) {
+        if ( getline(&line, &len, fp) < 0 ) {
+            pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+            LOGE("getline error");
+            return -1;
+        }
+        if ( !line ) {
+            pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+            LOGE("get one line segment error");
+            return -1;
+        }
+    }
+    pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+
     return 0;
 }
 
