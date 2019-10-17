@@ -7,8 +7,13 @@
 
 #ifndef _TRANSFER_H
 
+typedef int (*auth_cb_t)( char *user, char *passwd );
 
-extern int datachannel_send_data( uint8_t *data, int len);
+extern int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int max_size, unsigned int timeout );
+extern int lst_send_data( int ch, uint8_t *header, int hdr_len, uint8_t *data, int len);
+extern int lst_listen( int timeout );
+extern int lst_create_av_channel( int sid, auth_cb_t cb );
+extern int lst_init(const char *uid, const char *dev_name, const char *passwd);
 
 #define _TRANSFER_H
 #endif

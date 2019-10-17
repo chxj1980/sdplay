@@ -11,12 +11,12 @@
  *      1.1 检查sd卡是否满了
  * 2.tutk传输
  *      2.1 引入中间层
- * 3.片段信息保存
- * 4.片段信息发送
+ * 3.片段信息保存 √
+ * 4.片段信息发送 √
  * 5.测试计划
  *      5.1 ts的存储
  * 6.一些之前gos的信令，比如sd卡格式化,获取设备状态等
- * 7.有些地方操作文件没有加锁
+ * 7.有些地方操作文件没有加锁 √
  * 8.回放支持多通道
  * 9.tutk信令部分
  * */
@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include "transfer.h"
 #include "md5.h"
+#include "transfer.h"
 
 #define RED                  "\e[0;31m"
 #define NONE                 "\e[0m"
@@ -44,7 +45,7 @@
 
 #define PARAM_CHECK_AND_RETURN( cond )  if ( !(cond) ) { LOGE("check "#cond" error"); return -1; }
 #define PTR_CHECK_AND_RETURN( ptr ) if ( !(ptr) ) { LOGE("check pointer "#ptr" error"); return -1; }
-#define CALL_FUNC_AND_RETURN( func ) if( !(func) ) { LOGE("call "#func" error");return -1; }
+#define CALL( func ) if( !(func) ) { LOGE("call "#func" error");return -1; }
 #define ASSERT assert
 #define INDEX_DB "tsindexdb"
 #define SEGMENT_DB_FILENAME "segmentdb"
@@ -82,6 +83,7 @@ int sdp_init( const char *ts_path, const char *sd_mount_path )
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
     pthread_mutex_init( &g_sdplay_info.mutex, NULL );
     pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
+    lst_init();
 
     return 0;
 }
@@ -194,13 +196,13 @@ static int release_sd_space()
     size_t len = 0;
     char *line = NULL;
 
-    CALL_FUNC_AND_RETURN( get_db_filename(db_file) );
+    CALL( get_db_filename(db_file) );
     if ( (fp = fopen(db_file, "r")) == NULL ) {
         LOGE("open file %s error", db_file );
         return -1;
     }
     for (i = 0; i < g_sdplay_info.ts_delete_count_when_full; ++i) {
-        CALL_FUNC_AND_RETURN( getline(&line, &len, fp) );
+        CALL( getline(&line, &len, fp) );
         if ( !line ) {
             LOGE("check line error");
             fclose( fp );
@@ -216,7 +218,7 @@ static int release_sd_space()
     return 0;
 }
 
-int sdp_save_ts(const uint8_t *ts_buf, size_t size, int64_t starttime, int64_t endtime, segment_info_t *seg_info )
+int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime, segment_info_t *seg_info )
 {
     char filename[512] = { 0 };
     FILE *fp = NULL;
@@ -228,12 +230,12 @@ int sdp_save_ts(const uint8_t *ts_buf, size_t size, int64_t starttime, int64_t e
         release_sd_space();
         remove_records_from_index_db();
     }
-    snprintf( filename, sizeof(filename), "%s/%"PRId64"-%"PRId64".ts", starttime, endtime );
-    CALL_FUNC_AND_RETURN( fp = fopen(filename, "w") );
+    snprintf( filename, sizeof(filename), "%d-%d.ts", starttime, endtime );
+    CALL( fp = fopen(filename, "w") );
     fwrite(fp, ts_buf, size, 1, fp);
     fclose(fp);
-    CALL_FUNC_AND_RETURN( add_record_to_index_db(filename) );
-    CALL_FUNC_AND_RETURN(get_sd_free_space(&free_space));
+    CALL( add_record_to_index_db(filename) );
+    CALL(get_sd_free_space(&free_space));
 
     return 0;
 }
@@ -251,13 +253,13 @@ static int get_file_size( const char *file )
     return( (int)stat_buf.st_size );
 }
 
-static int parse_one_record( char *record, int64_t *starttime, int64_t *endtime )
+static int parse_one_record( char *record, int *starttime, int *endtime )
 {
     ASSERT( record );
     ASSERT( starttime );
     ASSERT( endtime );
 
-    sscanf( record, "%"PRId64"-%"PRId64"", starttime, endtime );
+    sscanf( record, "%d-%d", starttime, endtime );
 
     return 0;
 }
@@ -337,7 +339,7 @@ static int get_record_info_in_db(const char *db_file, int *_record_len, int *tot
         LOGE("open file %s error", db_file );
         return -1;
     }
-    CALL_FUNC_AND_RETURN( getline( &line, &record_len, fp) );
+    CALL( getline( &line, &record_len, fp) );
     if ( !record_len ) {
         LOGE("get record from %s error", db_file);
         return -1;
@@ -359,9 +361,9 @@ static int find_location_in_db(const char *db_file, int64_t starttime, int64_t e
     ASSERT( end );
     ASSERT( db_file );
 
-    CALL_FUNC_AND_RETURN( get_record_info_in_db(db_file, &record_len, &total_record_count) );
-    CALL_FUNC_AND_RETURN( start_pos = _find_location_in_db(db_file, FIND_START,  starttime, record_len, total_record_count) );
-    CALL_FUNC_AND_RETURN( end_pos = _find_location_in_db(db_file, FIND_END, endtime, record_len, total_record_count) );
+    CALL( get_record_info_in_db(db_file, &record_len, &total_record_count) );
+    CALL( start_pos = _find_location_in_db(db_file, FIND_START,  starttime, record_len, total_record_count) );
+    CALL( end_pos = _find_location_in_db(db_file, FIND_END, endtime, record_len, total_record_count) );
     *start = start_pos;
     *end = end_pos;
 
@@ -414,23 +416,30 @@ int sdp_send_ts_list(int64_t starttime, int64_t endtime)
     ASSERT( g_sdplay_info.ts_path );
     ASSERT( endtime );
 
+    pthread_mutex_lock( &g_sdplay_info.mutex );
     snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
     if ( (db_fp = fopen(db_file, "r") ) == NULL) {
         LOGE("open file %s error", db_file );
+        pthread_mutex_unlock( &g_sdplay_info.mutex );
         return -1;
     }
-    CALL_FUNC_AND_RETURN( find_location_in_db(db_file,starttime, endtime, &start_pos, &end_pos) );
+    if( find_location_in_db(db_file,starttime, endtime, &start_pos, &end_pos) < 0){
+        pthread_mutex_unlock( &g_sdplay_info.mutex );
+        return -1;
+    }
     count = end_pos - start_pos;
     ASSERT( count );
     for (i = 0; i < count; ++i) {
         if ( getline( &line, &len, db_fp) < 0 ) {
             fclose( db_fp );
+            pthread_mutex_unlock( &g_sdplay_info.mutex );
             LOGE("getline error");
             return -1;
         }
-        CALL_FUNC_AND_RETURN( filesize = get_file_size(line) );
+        CALL( filesize = get_file_size(line) );
         if ( (ts_fp = fopen(line, "r")) == NULL) {
             fclose( db_fp );
+            pthread_mutex_unlock( &g_sdplay_info.mutex );
             LOGE("open file %s error", line );
             return -1;
         }
@@ -440,15 +449,16 @@ int sdp_send_ts_list(int64_t starttime, int64_t endtime)
         if ( fread( buf_ptr, filesize, 1, fp) < 0 ) {
             fclose( db_fp );
             LOGE("fread error");
+            pthread_mutex_unlock( &g_sdplay_info.mutex );
             return -1;
         }
-        CALL_FUNC_AND_RETURN( calc_ts_md5(buf_ptr, filesize, md5 ) );
-        CALL_FUNC_AND_RETURN( gen_packet_header( pkt_hdr, md5, starttime, filesize, i == count-1 ) );
-        CALL_FUNC_AND_RETURN( datachannel_send_data(pkt_hdr, sizeof(pkt_hdr)) );
-        CALL_FUNC_AND_RETURN( datachannel_send_data(buf_ptr, filesize) );
+        CALL( calc_ts_md5(buf_ptr, filesize, md5 ) );
+        CALL( gen_packet_header( pkt_hdr, md5, starttime, filesize, i == count-1 ) );
+        CALL( lst_send_data(g_sdplay_info.ch, pkt_hdr, sizeof(pkt_hdr), buf_ptr, filesize));
         fclose(ts_fp);
     }
     fclose( db_fp );
+    pthread_mutex_unlock( &g_sdplay_info.mutex );
 
     return 0;
 }
@@ -468,7 +478,7 @@ int sdp_save_segment_info(int64_t starttime, int64_t endtime)
     char segment_db_file[256] = { 0 };
     char line[SEGMENT_RECORD_LEN] = {0};
 
-    CALL_FUNC_AND_RETURN( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
+    CALL( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
     snprintf(line, sizeof(line), "%"TIME_IN_SEC_LEN PRId64"-%"TIME_IN_SEC_LEN PRId64"\n", starttime, endtime );
     if ( (fp = fopen( segment_db_file, "a") ) == NULL ) {
@@ -487,30 +497,55 @@ int sdp_send_segment_list(int64_t starttime, int64_t endtime)
     char segment_db_file[256] = { 0 };
     FILE *fp = NULL;
     int start_pos = 0, end_pos = 0, count = 0;
+    int starttime = 0, endtime = 0;
     char *line = NULL;
     size_t len = 0;
+    int record_len = 0, count = 0;
+    char count_str[4] = {0};
+    char time_str[4] = {0};
 
-    CALL_FUNC_AND_RETURN( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) );
+    CALL( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
-    CALL_FUNC_AND_RETURN( find_location_in_db(segment_db_file, starttime, endtime, &start_pos, &end_pos) );
-    if ( ( fp = fopen(segment_db_file, "r") ) == NULL ) {
+    if ( get_record_info_in_db(segment_db_file, &record_len, &count) < 0 ) {
+        LOGE("get record info error");
         pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
-        return -1;
+        goto err;
+    }
+    *(int*)&count_str = htonl(count);
+    if (datachannel_send_data( count_str, sizeof(count_str) )<0) {
+        LOGE("send data error");
+        goto err;
+    }
+    CALL( find_location_in_db(segment_db_file, starttime, endtime, &start_pos, &end_pos) );
+    if ( ( fp = fopen(segment_db_file, "r") ) == NULL ) {
+        LOGE("open file %s error", segment_db_file );
+        goto err;
     }
     for (i = 0; i < count; ++i) {
         if ( getline(&line, &len, fp) < 0 ) {
-            pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
             LOGE("getline error");
-            return -1;
+            goto err;
         }
         if ( !line ) {
-            pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
             LOGE("get one line segment error");
-            return -1;
+            goto err;
         }
+        if( parse_one_record(line, &starttime, &endtime ) < 0 ) {
+            goto err;
+        }
+        *(int*)&time_str = htonl(starttime);
+        if (datachannel_send_data( time_str, sizeof(time_str)) < 0 ) 
+            goto err;
+        *(int*)&endtime = htonl(starttime);
+        if (datachannel_send_data( time_str, sizeof(time_str)) < 0 ) 
+            goto err;
     }
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
 
     return 0;
+err:
+    if (fp) fclose( fp );
+    pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
+    return -1;
 }
 
