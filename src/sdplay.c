@@ -123,6 +123,7 @@ static int add_record_to_index_db( const char *ts_name )
         return -1;
     }
     fwrite(ts_name, strlen(ts_name), 1, fp);
+    fwrite("\n", 1, 1, fp);
     fclose(fp);
     pthread_mutex_unlock( &g_sdplay_info.mutex );
 
@@ -225,6 +226,7 @@ int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime)
     char filename[512] = { 0 };
     FILE *fp = NULL;
     unsigned long long free_space = 0;
+    int ret = 0;
 
     ASSERT( ts_buf );
 
@@ -233,8 +235,12 @@ int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime)
         remove_records_from_index_db();
     }
     snprintf( filename, sizeof(filename), "%d-%d.ts", starttime, endtime );
-    CALL( fp = fopen(filename, "w") );
-    fwrite( ts_buf, size, 1, fp);
+    if( (fp = fopen(filename, "w")) == NULL ){
+        LOGE("open %s error, %s", filename, strerror(errno) );
+        return -1;
+    }
+    ret = fwrite( ts_buf, size, 1, fp);
+    LOGI("ret = %d", ret );
     fclose(fp);
     CALL( add_record_to_index_db(filename) );
     CALL(get_sd_free_space(&free_space));

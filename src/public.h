@@ -10,7 +10,7 @@
 #include <errno.h>
 
 #define ASSERT assert
-#define CALL( func ) if( (func) != 0 ) { LOGE("call "#func" error, %s", strerror(errno));return -1; }
+#define CALL( func ) if( (func) < 0 ) { LOGE("call "#func" error, %s", strerror(errno));return -1; }
 
 #define _PUBLIC_H
 #endif
