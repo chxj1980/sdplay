@@ -7,6 +7,13 @@
 
 #ifndef _TRANSFER_H
 
+enum {
+    LST_START_PLAY = 0x100,
+    LST_STOP_PLAY,
+};
+
+#define LST_ERR_TIMEOUT -2
+
 typedef int (*auth_cb_t)( char *user, char *passwd );
 
 extern int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int max_size, unsigned int timeout );

@@ -9,7 +9,7 @@
 /*
  * 1.删除策略 √
  *      1.1 检查sd卡是否满了
- * 2.tutk传输
+ * 2.tutk传输 √
  *      2.1 引入中间层
  * 3.片段信息保存 √
  * 4.片段信息发送 √
@@ -22,6 +22,7 @@
  * */
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <pthread.h>
@@ -33,20 +34,12 @@
 #include "transfer.h"
 #include "md5.h"
 #include "transfer.h"
-
-#define RED                  "\e[0;31m"
-#define NONE                 "\e[0m"
-
-#define LOGE( args...) do { \
-    printf( RED"| %20s | ERROR | %s:%d(%s)# "NONE, __FILE_NAME__, __LINE__, __FUNCTION__); \
-    printf(args); \
-    printf("\n"); \
-} while(0)
+#include "dbg.h"
+#include "sdplay.h"
+#include "public.h"
 
 #define PARAM_CHECK_AND_RETURN( cond )  if ( !(cond) ) { LOGE("check "#cond" error"); return -1; }
 #define PTR_CHECK_AND_RETURN( ptr ) if ( !(ptr) ) { LOGE("check pointer "#ptr" error"); return -1; }
-#define CALL( func ) if( !(func) ) { LOGE("call "#func" error");return -1; }
-#define ASSERT assert
 #define INDEX_DB "tsindexdb"
 #define SEGMENT_DB_FILENAME "segmentdb"
 #define INDEX_DB_TMP "tsindexdb.tmp"
@@ -54,9 +47,11 @@
 #define PKT_HDR_LEN 10
 #define SD_SPACE_THREHOLD (1024*1024)// 1M
 #define DELETE_TS_COUNT (1024) // each time sd full,delete 1024 ts
-#define TIME_IN_SEC_LEN (10)
-#define TIME_STR(t) #t
-#define TIME_FILL_ZERO_LEN "0"TIME_STR(TIME_IN_SEC_LEN)
+#define TIME_IN_SEC_LEN 10
+#define _TIME_STR(t) "0"#t
+#define TIME_STR(t) _TIME_STR(t)
+#define TIME_FILL_ZERO_LEN TIME_STR(TIME_IN_SEC_LEN)
+#define SEGMENT_RECORD_LEN (TIME_IN_SEC_LEN*2+1)
 
 enum {
     FIND_START = 1,
@@ -67,23 +62,31 @@ typedef struct {
     const char *ts_path;
     const char *sd_mount_path;
     int ts_delete_count_when_full;
+    int ch;
     pthread_mutex_t mutex;
     pthread_mutex_t segment_db_mutex;
 } sdplay_info_t;
 
 static sdplay_info_t g_sdplay_info;
 
-int sdp_init( const char *ts_path, const char *sd_mount_path )
+int sdp_init( const char *ts_path,
+        const char *sd_mount_path,
+        const char *uid,
+        const char *dev_name,
+        const char *passwd )
 {
     ASSERT( ts_path );
     ASSERT( sd_mount_path );
+    ASSERT( uid );
+    ASSERT( dev_name );
+    ASSERT( passwd );
 
     g_sdplay_info.ts_path = strdup(ts_path);
     g_sdplay_info.sd_mount_path = strdup(sd_mount_path);
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
     pthread_mutex_init( &g_sdplay_info.mutex, NULL );
     pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
-    lst_init();
+    lst_init( uid, dev_name, passwd );
 
     return 0;
 }
@@ -99,7 +102,7 @@ static int get_sd_free_space(unsigned long long *free_space)
         LOGE("statfs error");
         return -1;
     }
-    *frees_space = (statbuf.f_bfree)*(statbuf.f_bsize);
+    *free_space = (statbuf.f_bfree)*(statbuf.f_bsize);
 
     return 0;
 }
@@ -131,13 +134,12 @@ static int remove_records_from_index_db()
     int i = 0;
     char *linep = NULL;
     size_t len = 0;
-    ssize_t read = NULL;
-    FILE *fp_old = NULL, fp_new = NULL;
+    ssize_t read = 0;
+    FILE *fp_old = NULL, *fp_new = NULL;
     char db_file[256] = { 0 };
     char new_db_file[256] = { 0 };
     struct stat stat_buf;
 
-    ASSERT( number );
     ASSERT( g_sdplay_info.ts_path );
 
     snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
@@ -196,7 +198,7 @@ static int release_sd_space()
     size_t len = 0;
     char *line = NULL;
 
-    CALL( get_db_filename(db_file) );
+    CALL( get_db_filename(db_file, sizeof(db_file)) );
     if ( (fp = fopen(db_file, "r")) == NULL ) {
         LOGE("open file %s error", db_file );
         return -1;
@@ -218,13 +220,13 @@ static int release_sd_space()
     return 0;
 }
 
-int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime, segment_info_t *seg_info )
+int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime)
 {
     char filename[512] = { 0 };
     FILE *fp = NULL;
     unsigned long long free_space = 0;
 
-    PARAM_CHECK_AND_RETURN(ts_buf || seg_info);
+    ASSERT( ts_buf );
 
     if ( free_space < SD_SPACE_THREHOLD ) {
         release_sd_space();
@@ -232,7 +234,7 @@ int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime, 
     }
     snprintf( filename, sizeof(filename), "%d-%d.ts", starttime, endtime );
     CALL( fp = fopen(filename, "w") );
-    fwrite(fp, ts_buf, size, 1, fp);
+    fwrite( ts_buf, size, 1, fp);
     fclose(fp);
     CALL( add_record_to_index_db(filename) );
     CALL(get_sd_free_space(&free_space));
@@ -289,7 +291,6 @@ static int _find_location_in_db(const char *db_file, int find_type, int64_t time
             LOGE("getline error");
             fclose( fp );
             return -1;
-            goto err_close_file; 
         }
         parse_one_record( line, &pre_record_starttime , &pre_record_endtime );
         if ( getline( &line, &len, fp) < 0 ) {
@@ -321,7 +322,7 @@ static int _find_location_in_db(const char *db_file, int find_type, int64_t time
 static int get_record_info_in_db(const char *db_file, int *_record_len, int *total_record_count)
 {
     size_t record_len = 0;
-    int filesize = 0;
+    int filesize = 0, record_count = 0;
     char *line = NULL;
     FILE *fp = NULL;
 
@@ -346,7 +347,7 @@ static int get_record_info_in_db(const char *db_file, int *_record_len, int *tot
     }
     record_count = filesize/record_len;
     *_record_len = record_len;
-    *total_record_count = record_cound;
+    *total_record_count = record_count;
     fclose( fp );
 
     return 0;
@@ -446,7 +447,7 @@ int sdp_send_ts_list(int64_t starttime, int64_t endtime)
         buf_ptr = (uint8_t *)malloc(filesize);
         memset( buf_ptr, 0, filesize );
         PTR_CHECK_AND_RETURN( buf_ptr );
-        if ( fread( buf_ptr, filesize, 1, fp) < 0 ) {
+        if ( fread( buf_ptr, filesize, 1, ts_fp) < 0 ) {
             fclose( db_fp );
             LOGE("fread error");
             pthread_mutex_unlock( &g_sdplay_info.mutex );
@@ -472,7 +473,7 @@ static int get_segment_db_filename( char *out_filename, int buflen )
     return 0;
 }
 
-int sdp_save_segment_info(int64_t starttime, int64_t endtime)
+int sdp_save_segment_info(int starttime, int endtime)
 {
     FILE *fp = NULL;
     char segment_db_file[256] = { 0 };
@@ -480,19 +481,19 @@ int sdp_save_segment_info(int64_t starttime, int64_t endtime)
 
     CALL( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
-    snprintf(line, sizeof(line), "%"TIME_IN_SEC_LEN PRId64"-%"TIME_IN_SEC_LEN PRId64"\n", starttime, endtime );
+    snprintf(line, sizeof(line), "%" TIME_FILL_ZERO_LEN "d-%" TIME_FILL_ZERO_LEN "d\n", starttime, endtime );
     if ( (fp = fopen( segment_db_file, "a") ) == NULL ) {
         LOGE("open file %s error", segment_db_file);
         pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
         return -1;
     }
     fwrite(line, strlen(line), 1, fp);
-    fclsoe(fp);
+    fclose(fp);
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
     return 0;
 }
 
-int sdp_send_segment_list(int64_t starttime, int64_t endtime)
+int sdp_send_segment_list(int64_t in_starttime, int64_t in_endtime)
 {
     char segment_db_file[256] = { 0 };
     FILE *fp = NULL;
@@ -500,9 +501,8 @@ int sdp_send_segment_list(int64_t starttime, int64_t endtime)
     int starttime = 0, endtime = 0;
     char *line = NULL;
     size_t len = 0;
-    int record_len = 0, count = 0;
-    char count_str[4] = {0};
-    char time_str[4] = {0};
+    int record_len = 0, i = 0;
+    uint8_t time_buf[8] = {0};
 
     CALL( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
@@ -511,12 +511,7 @@ int sdp_send_segment_list(int64_t starttime, int64_t endtime)
         pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
         goto err;
     }
-    *(int*)&count_str = htonl(count);
-    if (datachannel_send_data( count_str, sizeof(count_str) )<0) {
-        LOGE("send data error");
-        goto err;
-    }
-    CALL( find_location_in_db(segment_db_file, starttime, endtime, &start_pos, &end_pos) );
+    CALL( find_location_in_db(segment_db_file, in_starttime, in_endtime, &start_pos, &end_pos) );
     if ( ( fp = fopen(segment_db_file, "r") ) == NULL ) {
         LOGE("open file %s error", segment_db_file );
         goto err;
@@ -533,11 +528,9 @@ int sdp_send_segment_list(int64_t starttime, int64_t endtime)
         if( parse_one_record(line, &starttime, &endtime ) < 0 ) {
             goto err;
         }
-        *(int*)&time_str = htonl(starttime);
-        if (datachannel_send_data( time_str, sizeof(time_str)) < 0 ) 
-            goto err;
-        *(int*)&endtime = htonl(starttime);
-        if (datachannel_send_data( time_str, sizeof(time_str)) < 0 ) 
+        *(int*)&time_buf = htonl(starttime);
+        *(int*)(&time_buf + 4) = htonl(endtime);
+        if ( lst_send_data(g_sdplay_info.ch, NULL, 0, time_buf, sizeof(time_buf)) <0 )
             goto err;
     }
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
