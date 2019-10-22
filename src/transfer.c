@@ -64,6 +64,11 @@ static void *login_thread(void *arg)
     return NULL;
 }
 
+int lst_login_success()
+{
+    return g_lst_info.login_success;
+}
+
 int lst_init(const char *uid, const char *dev_name, const char *passwd)
 {
     int ret = 0;
@@ -108,14 +113,15 @@ int lst_listen( int timeout )
 
     sid = IOTC_Listen( timeout );
     if ( sid < 0 ) {
-        LOGE("IOTC_Listen() error, sid = %d\n", sid );
+        LOGE("IOTC_Listen() error, sid = %d", sid );
+        sleep(1);
         return -1;
     }
 
     return sid;
 }
 
-int lst_create_av_channel( int sid, auth_cb_t cb )
+int lst_create_data_channel( int sid, auth_cb_t cb )
 {
     int resend=-1;
     int index = avServStart3( sid, cb, 0, 0, 0, &resend);
@@ -130,7 +136,7 @@ int lst_create_av_channel( int sid, auth_cb_t cb )
         char *mode[3] = {"P2P", "RLY", "LAN"};
 
         if( isdigit( s_info.RemoteIP[0] ) )
-            LOGI("Client is from[IP:%s, Port:%d] Mode[%s] VPG[%d:%d:%d] VER[%X] NAT[%d] AES[%d]\n",
+            LOGI("Client is from[IP:%s, Port:%d] Mode[%s] VPG[%d:%d:%d] VER[%X] NAT[%d] AES[%d]",
                    s_info.RemoteIP,
                    s_info.RemotePort,
                    mode[(int)s_info.Mode],
@@ -156,18 +162,30 @@ int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int max_size,
         if ( ret == AV_ER_TIMEOUT ) {
             return LST_ERR_TIMEOUT;
         } else {
-            LOGE("get cmd error");
+            LOGE("avRecvIOCtrl error, ret = %d", ret);
             return -1;
         }
     }
 
-    LOGI("cmd = 0x%x\n", cmd );
+    LOGI("recv cmd:0x%x", cmd );
     switch( cmd ) {
     case IOTYPE_USER_IPCAM_START:
         *out_cmd = LST_START_PLAY;
         break;
     case IOTYPE_USER_IPCAM_STOP:
         *out_cmd = LST_STOP_PLAY;
+        break;
+    case IOTYPE_USER_IPCAM_LISTEVENT_REQ:
+        *out_cmd = LST_USER_IPCAM_LISTEVENT_REQ;
+        break;
+    case IOTYPE_USER_IPCAM_RECORD_PLAYCONTROL:
+        *out_cmd = LST_USER_IPCAM_RECORD_PLAYCONTROL;
+        break;
+    case IOTYPE_USER_IPCAM_AUDIOSTART:
+        *out_cmd = LST_USER_IPCAM_AUDIOSTART;
+        break;
+    case IOTYPE_USER_IPCAM_PTZ_COMMAND:
+        *out_cmd = LST_USER_IPCAM_PTZ_COMMAND;
         break;
     default:
         break;

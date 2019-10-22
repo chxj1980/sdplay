@@ -22,6 +22,7 @@
  * */
 
 #include <stdio.h>
+#include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -38,36 +39,211 @@
 #include "sdplay.h"
 #include "public.h"
 
+#define SDPLAY_DBG 0
+
 #define PARAM_CHECK_AND_RETURN( cond )  if ( !(cond) ) { LOGE("check "#cond" error"); return -1; }
 #define PTR_CHECK_AND_RETURN( ptr ) if ( !(ptr) ) { LOGE("check pointer "#ptr" error"); return -1; }
 #define INDEX_DB "tsindexdb"
 #define SEGMENT_DB_FILENAME "segmentdb"
 #define INDEX_DB_TMP "tsindexdb.tmp"
 #define LENGTH_PER_RECORD 64
-#define PKT_HDR_LEN 10
+#define PKT_HDR_LEN 52
 #define SD_SPACE_THREHOLD (1024*1024)// 1M
-#define DELETE_TS_COUNT (1024) // each time sd full,delete 1024 ts
+//#define DELETE_TS_COUNT (1024) // each time sd full,delete 1024 ts
+#define DELETE_TS_COUNT (2) // each time sd full,delete 1024 ts
 #define TIME_IN_SEC_LEN 10
 #define _TIME_STR(t) "0"#t
 #define TIME_STR(t) _TIME_STR(t)
 #define TIME_FILL_ZERO_LEN TIME_STR(TIME_IN_SEC_LEN)
 #define SEGMENT_RECORD_LEN (TIME_IN_SEC_LEN*2+1)
+#define MAX_PKT_SIZE (1024*1024) /*  avServSetResendSize()函数最大发送为 1024KB 字节  */
+#define TS_MD5_LEN 33
+#define MAX_CHANNEL 8
 
 enum {
     FIND_START = 1,
     FIND_END
 };
 
+typedef enum {
+    AVIOCTRL_EVENT_ALL = 0x00,          // all event type(general APP-->IPCamera)
+    AVIOCTRL_EVENT_MOTIONDECT = 0x01,   // motion detect start//==s==
+    AVIOCTRL_EVENT_VIDEOLOST = 0x02,    // video lost alarm
+    AVIOCTRL_EVENT_IOALARM = 0x03,      // io alarmin start //---s--
+    AVIOCTRL_EVENT_MOTIONPASS = 0x04,   // motion detect end  //==e==
+    AVIOCTRL_EVENT_VIDEORESUME = 0x05,  // video resume
+    AVIOCTRL_EVENT_IOALARMPASS = 0x06,  // IO alarmin end   //---e--
+    AVIOCTRL_EVENT_MOVIE = 0x07,
+    AVIOCTRL_EVENT_TIME_LAPSE = 0x08,
+    AVIOCTRL_EVENT_EMERGENCY = 0x09,
+    AVIOCTRL_EVENT_EXPT_REBOOT = 0x10,  // system exception reboot
+    AVIOCTRL_EVENT_SDFAULT = 0x11,      // sd record exception
+    AVIOCTRL_EVENT_FULLTIME_RECORDING = 0x12,
+    AVIOCTRL_EVENT_PIR = 0x13,
+    AVIOCTRL_EVENT_RINGBELL = 0x14,
+    AVIOCTRL_EVENT_SOUND = 0x15,
+} ENUM_EVENTTYPE;
+
+
 typedef struct {
     const char *ts_path;
     const char *sd_mount_path;
     int ts_delete_count_when_full;
-    int ch;
+    int channels[MAX_CHANNEL];
+    int active_ch_num;
+    int running;
     pthread_mutex_t mutex;
     pthread_mutex_t segment_db_mutex;
 } sdplay_info_t;
 
+typedef struct {
+    unsigned short year;    // The number of year.
+    unsigned char month;    // The number of months since January, in the range 1 to 12.
+    unsigned char day;      // The day of the month, in the range 1 to 31.
+    unsigned char wday;     // The number of days since Sunday, in the range 0 to 6. (Sunday = 0, Monday = 1, ...)
+    unsigned char hour;     // The number of hours past midnight, in the range 0 to 23.
+    unsigned char minute;   // The number of minutes after the hour, in the range 0 to 59.
+    unsigned char second;   // The number of seconds after the minute, in the range 0 to 59.
+} time_day_t;
+
+typedef struct {
+    unsigned int channel;       // Camera Index
+    time_day_t st_starttime;       // Search event from ...
+    time_day_t st_endtime;         // ... to (search event)
+    unsigned int utc_starttime;  // utc time Search event from ...
+    unsigned int utc_endtime;    // utc time ... to (search event)
+    unsigned char event;        // event type, refer to ENUM_EVENTTYPE
+    unsigned char status;       // 0x00: Recording file exists, Event unreaded
+                                // 0x01: Recording file exists, Event readed
+                                // 0x02: No Recording file in the event
+    unsigned char reserved[2];
+} ioctl_list_event_req_t;
+
 static sdplay_info_t g_sdplay_info;
+
+static int auth_callback( char *user, char *passwd )
+{
+    ASSERT( user );
+    ASSERT( passwd );
+
+    if ( strncmp(user, "admin", 5) == 0
+            && strncmp(passwd, "12345", 5) == 0 ) 
+        return 1;
+
+    return 0;
+}
+
+static int list_event_handle(char *data)
+{
+    ioctl_list_event_req_t *req =  (ioctl_list_event_req_t *)data;
+
+    ASSERT(data);
+
+    LOGI("event:%d", req->event);
+    LOGI("channel:%d",req->channel);
+    LOGI("status:%d",req->status);
+    LOGI("starttime:%d", req->utc_starttime);
+    LOGI("endtime:%d", req->utc_endtime);
+    LOGI("st.stattime.year = %d", req->st_starttime.year );
+    LOGI("st.stattime.month = %d", req->st_starttime.month );
+    LOGI("st.stattime.day = %d", req->st_starttime.day );
+    LOGI("st.stattime.hour = %d", req->st_starttime.hour );
+    LOGI("st.stattime.minute = %d", req->st_starttime.minute );
+    LOGI("st.stattime.second = %d", req->st_starttime.second );
+
+    LOGI("st.endtime.year = %d", req->st_endtime.year );
+    LOGI("st.endtime.month = %d", req->st_endtime.month );
+    LOGI("st.endtime.day = %d", req->st_endtime.day );
+    LOGI("st.endtime.hour = %d", req->st_endtime.hour );
+    LOGI("st.endtime.minute = %d", req->st_endtime.minute );
+    LOGI("st.endtime.second = %d", req->st_endtime.second );
+
+    return 0;
+}
+
+static int cmd_handle(int cmd, char *data)
+{
+    switch(cmd) {
+        case LST_USER_IPCAM_RECORD_PLAYCONTROL:
+            LOGI("LST_USER_IPCAM_RECORD_PLAYCONTROL");
+            break;
+        case LST_USER_IPCAM_LISTEVENT_REQ:
+            LOGI("LST_USER_IPCAM_LISTEVENT_REQ");
+            if (list_event_handle(data) < 0)
+                goto err;
+            break;
+        case LST_START_PLAY:
+            LOGI("LST_START_PLAY");
+            break;
+        case LST_USER_IPCAM_AUDIOSTART:
+            LOGI("LST_USER_IPCAM_AUDIOSTART");
+            break;
+        case LST_USER_IPCAM_PTZ_COMMAND:
+            LOGI("LST_USER_IPCAM_PTZ_COMMAND");
+            break;
+        default:
+            break;
+    }
+
+    return 0;
+err:
+    return -1;
+}
+
+static void *ioctl_thread(void *arg)
+{
+    int sid = (int)arg, ch = 0;
+    int ret = 0;
+
+    if ((ch = lst_create_data_channel(sid, auth_callback )) < 0)
+        return NULL;
+    while( g_sdplay_info.running ) {
+        unsigned int cmd = 0;
+        char data[1024] = {0};
+
+        ret = lst_recv_ioctl(ch, &cmd, data, sizeof(data), 1000); 
+        if ( ret < 0 ) {
+            if ( ret == LST_ERR_TIMEOUT )
+                continue;
+            return NULL;
+        }
+        if (cmd_handle(cmd, data) < 0 ) {
+            LOGE("cmd_handle error");
+            return NULL;
+        }
+    }
+
+    return 0;
+}
+
+static void *sdplay_thread(void *arg)
+{
+    int sid = 0;
+    pthread_t tid;
+
+    (void)arg;
+
+    while( !lst_login_success() )
+        usleep(200);
+
+    while( g_sdplay_info.running ) {
+        LOGI("start to listen");
+        if ( (sid = lst_listen(0)) < 0 ) {
+            LOGE("lst_listen error");
+            continue;
+        }
+        LOGI("get connection from client, sid:%d", sid);
+        pthread_create(&tid, NULL, ioctl_thread, (void*)(uintptr_t)sid );
+    }
+
+    return NULL;
+}
+
+static inline int get_db_filename( char *out_db_filename, int buflen )
+{
+    snprintf( out_db_filename, buflen, "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
+    return 0;
+}
 
 int sdp_init( const char *ts_path,
         const char *sd_mount_path,
@@ -75,18 +251,22 @@ int sdp_init( const char *ts_path,
         const char *dev_name,
         const char *passwd )
 {
+    pthread_t tid;
+
     ASSERT( ts_path );
     ASSERT( sd_mount_path );
     ASSERT( uid );
     ASSERT( dev_name );
     ASSERT( passwd );
 
+    g_sdplay_info.running = 1;
     g_sdplay_info.ts_path = strdup(ts_path);
     g_sdplay_info.sd_mount_path = strdup(sd_mount_path);
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
     pthread_mutex_init( &g_sdplay_info.mutex, NULL );
     pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
     lst_init( uid, dev_name, passwd );
+    pthread_create(&tid, NULL, sdplay_thread, NULL);
 
     return 0;
 }
@@ -97,6 +277,11 @@ static int get_sd_free_space(unsigned long long *free_space)
 
     ASSERT( g_sdplay_info.sd_mount_path );
     ASSERT( free_space);
+
+#if SDPLAY_DBG
+    *free_space = 1024;
+    return 0;
+#endif
 
     if ( statfs(g_sdplay_info.sd_mount_path, &statbuf) < 0 ) {
         LOGE("statfs error");
@@ -114,6 +299,8 @@ static int add_record_to_index_db( const char *ts_name )
 
     ASSERT( ts_name );
     ASSERT( g_sdplay_info.ts_path );
+
+    LOGI("called");
 
     snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
     pthread_mutex_lock( &g_sdplay_info.mutex );
@@ -142,6 +329,7 @@ static int remove_records_from_index_db()
     struct stat stat_buf;
 
     ASSERT( g_sdplay_info.ts_path );
+    LOGI("called");
 
     snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
     snprintf( new_db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB_TMP );
@@ -179,15 +367,6 @@ static int remove_records_from_index_db()
     remove(db_file);
     rename(new_db_file, db_file);
     pthread_mutex_unlock( &g_sdplay_info.mutex );
-    return 0;
-}
-
-static int get_db_filename( char *out_db_filename, int buflen )
-{
-    ASSERT( out_db_filename );
-    ASSERT( g_sdplay_info.ts_path );
-
-    snprintf( out_db_filename, buflen, "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
     return 0;
 }
 
@@ -230,6 +409,7 @@ int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime)
 
     ASSERT( ts_buf );
 
+    CALL(get_sd_free_space(&free_space));
     if ( free_space < SD_SPACE_THREHOLD ) {
         release_sd_space();
         remove_records_from_index_db();
@@ -261,7 +441,7 @@ static int get_file_size( const char *file )
     return( (int)stat_buf.st_size );
 }
 
-static int parse_one_record( char *record, int *starttime, int *endtime )
+static inline int parse_one_record( char *record, int *starttime, int *endtime )
 {
     ASSERT( record );
     ASSERT( starttime );
@@ -359,15 +539,15 @@ static int get_record_info_in_db(const char *db_file, int *_record_len, int *tot
     return 0;
 }
 
-static int find_location_in_db(const char *db_file, int64_t starttime, int64_t endtime, int *start, int *end)
+static int find_location_in_db(char *db_file, int64_t starttime, int64_t endtime, int *start, int *end)
 {
     int total_record_count = 0, record_len = 0;
     int start_pos = 0, end_pos = 0;
 
     ASSERT( start );
     ASSERT( end );
-    ASSERT( db_file );
 
+    CALL(get_db_filename(db_file, sizeof(db_file)));
     CALL( get_record_info_in_db(db_file, &record_len, &total_record_count) );
     CALL( start_pos = _find_location_in_db(db_file, FIND_START,  starttime, record_len, total_record_count) );
     CALL( end_pos = _find_location_in_db(db_file, FIND_END, endtime, record_len, total_record_count) );
@@ -396,78 +576,187 @@ static int calc_ts_md5( uint8_t *inbuf, size_t inlen, char *outbuf )
     return 0;
 }
 
-static int gen_packet_header( uint8_t *pkt_hdr, char *md5, int ts_starttime, int ts_len, int islast )
+static int gen_packet_header(
+        int pkt_idx, 
+        int endflg, 
+        int starttime, 
+        int endtime,
+        int len,
+        char *md5,
+        uint8_t *out_pkt_hdr )
 {
-    ASSERT( pkt_hdr );
+#define PKT_HDR_APPEND_INT(val) *(uint32_t *)out_pkt_hdr = htonl(val); out_pkt_hdr += 4;
 
-    *(int *)pkt_hdr = htonl(ts_starttime);  pkt_hdr += 4;
-    *(int *)pkt_hdr = htonl(ts_len);        pkt_hdr += 4;
-    memcpy(pkt_hdr, md5, strlen(md5));      pkt_hdr += 33;
-    *pkt_hdr = islast;
+    ASSERT(out_pkt_hdr);
+
+    PKT_HDR_APPEND_INT( pkt_idx );
+    PKT_HDR_APPEND_INT( endflg );
+    if (pkt_idx != 0 && endflg) {
+        PKT_HDR_APPEND_INT( endtime );
+    } else {
+        PKT_HDR_APPEND_INT( starttime );
+    }
+    PKT_HDR_APPEND_INT( len );
+    if (endflg) 
+        memcpy(out_pkt_hdr, md5, TS_MD5_LEN);
 
     return 0;
 }
 
-int sdp_send_ts_list(int64_t starttime, int64_t endtime)
+
+static inline FILE *open_index_db(const char *mode)
+{
+    char db_file[256] = {0};
+    FILE *fp = NULL;
+
+    get_db_filename( db_file, sizeof(db_file));
+    fp = fopen(db_file, mode);
+    if ( !fp ) {
+        LOGE("open file %s error", db_file);
+    }
+    return fp;
+}
+
+static int read_file_to_buf(const char *file, uint8_t **outbuf, int *outsize)
+{
+    FILE *fp = NULL;
+    int filesize = 0;
+
+    ASSERT( file );
+    ASSERT( outbuf );
+    ASSERT( outsize );
+
+    if ( (fp = fopen(file, "r")) == NULL) {
+        LOGE("open file %s error", file );
+        goto err;
+    }
+    CALL( filesize = get_file_size(file) );
+    *outbuf = (uint8_t *)calloc(1, filesize);
+    if ( !(*outbuf) ) {
+        LOGE("calloc error, size:%d", filesize);
+        goto err;
+    }
+    if ( fread( *outbuf, filesize, 1, fp) < 0 ) {
+        LOGE("fread error");
+        goto err;
+    }
+    *outsize = filesize;
+    fclose(fp);
+
+    return 0;
+err:
+    if (*outbuf)
+        free(outbuf);
+    if (fp)
+        fclose(fp);
+    return -1;
+}
+
+static int send_pkt(
+        int ch,
+        int pkt_idx,
+        int endflg,
+        int starttime,
+        int endtime,
+        char *md5,
+        uint8_t *pkt,
+        int pkt_len )
+{
+    uint8_t pkt_hdr[PKT_HDR_LEN] = {0};
+    int i = 0;
+
+    CALL( gen_packet_header(pkt_idx, endflg, starttime, endtime, pkt_len, md5, pkt_hdr) );
+    for (i=0; i<g_sdplay_info.active_ch_num; i++) {
+        CALL( lst_send_data( ch, pkt_hdr, sizeof(pkt_hdr), pkt, pkt_len));
+    }
+    return 0;
+}
+
+static int send_ts(int ch, const char *ts_file, int starttime, int endtime)
+{
+    uint8_t *buf_ptr = NULL, *save= NULL;
+    int filesize = 0;
+    FILE *fp = NULL;
+    int pkt_count = 0, i = 0;
+    char md5[TS_MD5_LEN] = {0};
+
+    ASSERT( ts_file );
+
+    if(read_file_to_buf(ts_file, &buf_ptr, &filesize) < 0)
+        goto err;
+    save = buf_ptr;
+    if( calc_ts_md5(buf_ptr, filesize, md5) < 0)
+        goto err;
+    pkt_count = filesize/MAX_PKT_SIZE;
+    if (pkt_count == 1) {
+        if( send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize )<0)
+            goto err;
+    } else {
+        for (i=0; i<pkt_count; i++) {
+            if( send_pkt(ch, i, 0, starttime, endtime, md5, buf_ptr, MAX_PKT_SIZE ) < 0 )
+                goto err;
+            buf_ptr += MAX_PKT_SIZE;
+        }
+        if( send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize-(pkt_count*MAX_PKT_SIZE) ) < 0)
+            goto err;
+    }
+
+    fclose(fp);
+    free(save);
+    return 0;
+err:
+    if (fp)
+        fclose(fp);
+    if (save)
+        free(save);
+    return -1;
+}
+
+int sdp_send_ts_list(int ch, int starttime, int endtime)
 {
     int start_pos = 0, end_pos = 0;
-    FILE *db_fp = NULL, *ts_fp = NULL;
-    char db_file[256] = { 0 };
-    int count = 0, i = 0, filesize = 0;
+    FILE *db_fp = NULL;
+    int count = 0, i = 0;
     char *line = NULL;
     size_t len = 0;
-    uint8_t pkt_hdr[PKT_HDR_LEN] = {0};
-    uint8_t *buf_ptr = NULL;
-    char md5[33] = { 0 };
+    int ts_starttime = 0, ts_endtime = 0;
+    char db_file[256] = {0};
 
     ASSERT( g_sdplay_info.ts_path );
     ASSERT( endtime );
 
     pthread_mutex_lock( &g_sdplay_info.mutex );
-    snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
-    if ( (db_fp = fopen(db_file, "r") ) == NULL) {
-        LOGE("open file %s error", db_file );
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
-        return -1;
-    }
-    if( find_location_in_db(db_file,starttime, endtime, &start_pos, &end_pos) < 0){
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
-        return -1;
-    }
+    db_fp = open_index_db("r");
+    if ( !db_fp ) 
+        goto err;
+    if (get_db_filename(db_file, sizeof(db_file)) < 0)
+        goto err;
+    if( find_location_in_db(db_file, starttime, endtime, &start_pos, &end_pos) < 0)
+        goto err;
     count = end_pos - start_pos;
     ASSERT( count );
     for (i = 0; i < count; ++i) {
         if ( getline( &line, &len, db_fp) < 0 ) {
-            fclose( db_fp );
-            pthread_mutex_unlock( &g_sdplay_info.mutex );
             LOGE("getline error");
-            return -1;
+            free(line);
+            goto err;
         }
-        CALL( filesize = get_file_size(line) );
-        if ( (ts_fp = fopen(line, "r")) == NULL) {
-            fclose( db_fp );
-            pthread_mutex_unlock( &g_sdplay_info.mutex );
-            LOGE("open file %s error", line );
-            return -1;
-        }
-        buf_ptr = (uint8_t *)malloc(filesize);
-        memset( buf_ptr, 0, filesize );
-        PTR_CHECK_AND_RETURN( buf_ptr );
-        if ( fread( buf_ptr, filesize, 1, ts_fp) < 0 ) {
-            fclose( db_fp );
-            LOGE("fread error");
-            pthread_mutex_unlock( &g_sdplay_info.mutex );
-            return -1;
-        }
-        CALL( calc_ts_md5(buf_ptr, filesize, md5 ) );
-        CALL( gen_packet_header( pkt_hdr, md5, starttime, filesize, i == count-1 ) );
-        CALL( lst_send_data(g_sdplay_info.ch, pkt_hdr, sizeof(pkt_hdr), buf_ptr, filesize));
-        fclose(ts_fp);
+        if ( parse_one_record(line, &ts_starttime, &ts_endtime) < 0 )
+            goto err;
+        if( send_ts(ch, line, ts_starttime, ts_endtime) < 0 ) 
+            goto err;
+        free(line);
     }
     fclose( db_fp );
     pthread_mutex_unlock( &g_sdplay_info.mutex );
 
     return 0;
+
+err:
+    if (db_fp)
+        fclose(db_fp);
+    pthread_mutex_unlock( &g_sdplay_info.mutex );
+    return -1;
 }
 
 static int get_segment_db_filename( char *out_filename, int buflen )
@@ -499,7 +788,7 @@ int sdp_save_segment_info(int starttime, int endtime)
     return 0;
 }
 
-int sdp_send_segment_list(int64_t in_starttime, int64_t in_endtime)
+int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
 {
     char segment_db_file[256] = { 0 };
     FILE *fp = NULL;
@@ -536,7 +825,7 @@ int sdp_send_segment_list(int64_t in_starttime, int64_t in_endtime)
         }
         *(int*)&time_buf = htonl(starttime);
         *(int*)(&time_buf + 4) = htonl(endtime);
-        if ( lst_send_data(g_sdplay_info.ch, NULL, 0, time_buf, sizeof(time_buf)) <0 )
+        if ( lst_send_data(ch, NULL, 0, time_buf, sizeof(time_buf)) <0 )
             goto err;
     }
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
