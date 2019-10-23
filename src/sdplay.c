@@ -22,6 +22,7 @@
  * */
 
 #include <stdio.h>
+#include <errno.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
@@ -55,7 +56,7 @@
 #define _TIME_STR(t) "0"#t
 #define TIME_STR(t) _TIME_STR(t)
 #define TIME_FILL_ZERO_LEN TIME_STR(TIME_IN_SEC_LEN)
-#define SEGMENT_RECORD_LEN (TIME_IN_SEC_LEN*2+1)
+#define SEGMENT_RECORD_LEN (TIME_IN_SEC_LEN*2+1+1+1)
 #define MAX_PKT_SIZE (1024*1024) /*  avServSetResendSize()函数最大发送为 1024KB 字节  */
 #define TS_MD5_LEN 33
 #define MAX_CHANNEL 8
@@ -63,6 +64,13 @@
 enum {
     FIND_START = 1,
     FIND_END
+};
+
+enum {
+    JUDGE_CURRENT = 1,
+    JUDGE_NEXT,
+    JUDGE_LEFT,
+    JUDGE_RIGHT
 };
 
 typedef enum {
@@ -142,6 +150,8 @@ typedef struct {
     av_event_t events[1];        // The first memory address of the events in this package
 } ioctl_list_event_resp_t;
 
+static int get_record_info_in_db(const char *db_file, int *out_record_len, int *total_record_count);
+
 static sdplay_info_t g_sdplay_info;
 
 static int auth_callback( char *user, char *passwd )
@@ -169,32 +179,9 @@ static int list_event_handle(int ch,char *data)
     LOGI("status:%d",req->status);
     LOGI("starttime:%d", req->utc_starttime);
     LOGI("endtime:%d", req->utc_endtime);
-    LOGI("st.stattime.year = %d", req->st_starttime.year );
-    LOGI("st.stattime.month = %d", req->st_starttime.month );
-    LOGI("st.stattime.day = %d", req->st_starttime.day );
-    LOGI("st.stattime.hour = %d", req->st_starttime.hour );
-    LOGI("st.stattime.minute = %d", req->st_starttime.minute );
-    LOGI("st.stattime.second = %d", req->st_starttime.second );
 
-    LOGI("st.endtime.year = %d", req->st_endtime.year );
-    LOGI("st.endtime.month = %d", req->st_endtime.month );
-    LOGI("st.endtime.day = %d", req->st_endtime.day );
-    LOGI("st.endtime.hour = %d", req->st_endtime.hour );
-    LOGI("st.endtime.minute = %d", req->st_endtime.minute );
-    LOGI("st.endtime.second = %d", req->st_endtime.second );
-    eventlist = (ioctl_list_event_resp_t *)malloc(sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*3);
-    memset(eventlist, 0, sizeof(ioctl_list_event_resp_t));
-    eventlist->total = 1;
-    eventlist->index = 0;
-    eventlist->endflag = 1;
-    eventlist->count = 3;
-    for(i=0;i<eventlist->count;i++) {
-        eventlist->events[i].utc_starttime = 1571801203 - 120 - i*60;
-        eventlist->events[i].utc_endtime = 1571801203 - i*60;
-        eventlist->events[i].event = AVIOCTRL_EVENT_MOTIONDECT;
-        eventlist->events[i].status = 0;
-    }
-    lst_send_ioctl(ch, LST_USER_IPCAM_LISTEVENT_RESP, (char*)eventlist, sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*3);
+    if (sdp_send_segment_list(ch, req->utc_starttime, req->utc_endtime) < 0)
+        return -ERRINTERNAL;
 
     return 0;
 }
@@ -246,7 +233,6 @@ static void *ioctl_thread(void *arg)
             return NULL;
         }
         if (cmd_handle(ch, cmd, data) < 0 ) {
-            LOGE("cmd_handle error");
             return NULL;
         }
     }
@@ -490,72 +476,140 @@ static inline int parse_one_record( char *record, int *starttime, int *endtime )
     return 0;
 }
 
-static int _find_location_in_db(const char *db_file, int find_type, int64_t time, int record_len, int total_record_count)
+static int get_times( FILE *fp, int pos, int *starttime, int *endtime, int *next_starttime, int *next_endtime)
 {
-    int found = 0;
-    int cur_pos = 0;
-    FILE *fp = NULL;
-    size_t len = 0;
     char *line = NULL;
-    int record_start_time = 0, record_end_time = 0;
-    int pre_record_starttime = 0, pre_record_endtime = 0;
+    size_t len = 0;
 
-    ASSERT( total_record_count );
-    ASSERT( record_len );
-
-    if ( (fp = fopen(db_file, "r")) == NULL ) {
-        LOGE("open file %s error", db_file );
-        return -1;
+    fseek( fp, pos, SEEK_SET);
+    if ( getline(&line, &len, fp) < 0 ) {
+        LOGE("getline error, %s, line:%s", strerror(errno), line);
+        return -ERRINTERNAL;
     }
-
-    cur_pos = (total_record_count/2)*record_len;
-    while( !found ) {
-        fseek( fp, cur_pos - record_len, SEEK_SET);
-        if ( getline( &line, &len, fp) < 0 ) {
-            LOGE("getline error");
-            fclose( fp );
-            return -1;
-        }
-        parse_one_record( line, &pre_record_starttime , &pre_record_endtime );
-        if ( getline( &line, &len, fp) < 0 ) {
-            LOGE("getline error");
-            return -1;
-        }
-        parse_one_record( line, &record_start_time, &record_end_time );
-        if ( find_type == FIND_START ) {
-            if ( time <= record_start_time && time >= pre_record_endtime ) {
-                fclose( fp );
-                return cur_pos;
-            } else {
-                cur_pos = cur_pos/2;
-            }
-        } else {
-            if ( time >= pre_record_endtime && time <= record_start_time ) {
-                fclose( fp );
-                return cur_pos;
-            } else {
-                cur_pos = cur_pos + (total_record_count - cur_pos)/2;
-            }
-        }
+    parse_one_record(line, starttime, endtime);
+    if ( getline( &line, &len, fp) < 0 ) {
+        LOGE("getline error");
+        return -ERRINTERNAL;
     }
-
-    fclose( fp );
-    return -1;
+    parse_one_record(line, next_starttime, next_endtime);
+    return 0;
 }
 
-static int get_record_info_in_db(const char *db_file, int *_record_len, int *total_record_count)
+static int binary_search_pos( const char *db_file, int time, int (*judge_cb)(FILE *fp, int pos, int time))
+{
+    int low = 0,high,mid;
+    int record_len = 0,total = 0, ret = 0;
+    FILE *fp = NULL;
+
+    LOGI("db_file:%s", db_file);
+    if ( get_record_info_in_db(db_file, &record_len, &total) < 0 ) 
+        return -ERRINTERNAL;
+    high = total-1;
+
+    fp = fopen(db_file, "r");
+    if (!fp) {
+        LOGE("open %s error", db_file);
+        return -ERRINTERNAL;
+    }
+
+    while(low <= high) {
+        mid = (low+high)/2;
+        ret = judge_cb(fp, mid*record_len, time);
+        if (ret < 0) {
+            LOGE("judge_cb error");
+            goto err_close_file;
+        }
+        LOGI("ret:%d, mid:%d, low:%d, high:%d", ret, mid, low, high);
+        if (ret == JUDGE_CURRENT)
+            return mid*record_len;
+        else if (ret == JUDGE_NEXT)
+            return (mid+1)*record_len;
+        else if (ret == JUDGE_LEFT)
+            high = mid - 1;
+        else if (ret == JUDGE_RIGHT)
+            low = mid + 1;
+        else {
+            LOGE("judge_cb error");
+            goto err_close_file;
+        }
+    }
+    if (mid == 0 || mid == total)
+        return mid*record_len;
+
+    LOGE("binary search error,mid:%d",mid);
+    return -ERRINTERNAL;
+err_close_file:
+    fclose(fp);
+    return -ERRINTERNAL;
+}
+
+static int find_start_judge_callback(FILE *fp, int pos, int time)
+{
+    int starttime, endtime, next_starttime, next_endtime;
+
+    if (get_times(fp, pos, &starttime, &endtime, &next_starttime, &next_endtime) < 0)
+        return -ERRINTERNAL;
+    if (time == starttime ||
+            (time > starttime && time < next_starttime))
+        return JUDGE_CURRENT;
+    if (time == next_starttime)
+        return JUDGE_NEXT;
+    if (time > starttime)
+        return JUDGE_RIGHT;
+    if (time < starttime)
+        return JUDGE_LEFT;
+
+    LOGE("unexpect error");
+    return -ERRINTERNAL;
+}
+
+static int find_end_judge_callback(FILE *fp, int pos, int time)
+{
+    int starttime, endtime, next_starttime, next_endtime;
+
+    if (get_times(fp, pos, &starttime, &endtime, &next_starttime, &next_endtime) < 0)
+        return -ERRINTERNAL;
+    LOGI("time:%d endtime:%d next:%d",time, endtime, next_endtime);
+    if (time == endtime ||
+            (time > endtime && time < next_endtime))
+        return JUDGE_CURRENT;
+    if (time == next_endtime)
+        return JUDGE_NEXT;
+    if (time > endtime)
+        return JUDGE_RIGHT;
+    if (time < endtime)
+        return JUDGE_LEFT;
+
+    LOGE("unexpect error");
+    return -ERRINTERNAL;
+}
+
+static int find_start_pos(char *db_file, int starttime)
+{
+    return(binary_search_pos(db_file, starttime, find_start_judge_callback));
+}
+
+static int find_end_pos(char *db_file, int endtime)
+{
+    return(binary_search_pos(db_file, endtime, find_end_judge_callback));
+}
+
+static int get_record_info_in_db(const char *db_file, int *out_record_len, int *total_record_count)
 {
     size_t record_len = 0;
+    ssize_t ret = 0;
     int filesize = 0, record_count = 0;
     char *line = NULL;
     FILE *fp = NULL;
 
     ASSERT( db_file );
-    ASSERT( record_len );
+    ASSERT( out_record_len );
     ASSERT( total_record_count );
 
-    if ( (filesize = get_file_size(db_file)) <= 0 ) 
+    if ( (filesize = get_file_size(db_file)) <= 0 ) {
+        LOGE("get_file_size error");
         return -1;
+    }
     if ( filesize == 0 ) {
         LOGE("file %s empty", db_file);
         return ERR_FILE_EMPTY;
@@ -564,33 +618,15 @@ static int get_record_info_in_db(const char *db_file, int *_record_len, int *tot
         LOGE("open file %s error", db_file );
         return -1;
     }
-    CALL( getline( &line, &record_len, fp) );
-    if ( !record_len ) {
+    ret = getline( &line, &record_len, fp);
+    if (ret < 0) {
         LOGE("get record from %s error", db_file);
         return -1;
     }
-    record_count = filesize/record_len;
-    *_record_len = record_len;
+    record_count = filesize/(int)ret;
+    *out_record_len = (int)ret;
     *total_record_count = record_count;
     fclose( fp );
-
-    return 0;
-}
-
-static int find_location_in_db(char *db_file, int64_t starttime, int64_t endtime, int *start, int *end)
-{
-    int total_record_count = 0, record_len = 0;
-    int start_pos = 0, end_pos = 0;
-
-    ASSERT( start );
-    ASSERT( end );
-
-    CALL(get_db_filename(db_file, sizeof(db_file)));
-    CALL( get_record_info_in_db(db_file, &record_len, &total_record_count) );
-    CALL( start_pos = _find_location_in_db(db_file, FIND_START,  starttime, record_len, total_record_count) );
-    CALL( end_pos = _find_location_in_db(db_file, FIND_END, endtime, record_len, total_record_count) );
-    *start = start_pos;
-    *end = end_pos;
 
     return 0;
 }
@@ -769,9 +805,14 @@ int sdp_send_ts_list(int ch, int starttime, int endtime)
         goto err;
     if (get_db_filename(db_file, sizeof(db_file)) < 0)
         goto err;
-    if( find_location_in_db(db_file, starttime, endtime, &start_pos, &end_pos) < 0)
-        goto err;
-    count = end_pos - start_pos;
+    start_pos = find_start_pos(db_file, starttime);
+    if (start_pos < 0)
+        return -ERRINTERNAL;
+    LOGI("start:%d", start_pos);
+    end_pos = find_end_pos(db_file, endtime);
+    if (end_pos < 0)
+        return -ERRINTERNAL;
+    count = end_pos - start_pos + 1;
     ASSERT( count );
     for (i = 0; i < count; ++i) {
         if ( getline( &line, &len, db_fp) < 0 ) {
@@ -797,7 +838,7 @@ err:
     return -1;
 }
 
-static int get_segment_db_filename( char *out_filename, int buflen )
+static inline int get_segment_db_filename( char *out_filename, int buflen )
 {
     ASSERT( out_filename );
     ASSERT( g_sdplay_info.ts_path );
@@ -812,6 +853,8 @@ int sdp_save_segment_info(int starttime, int endtime)
     char segment_db_file[256] = { 0 };
     char line[SEGMENT_RECORD_LEN] = {0};
 
+    if (starttime < 0 || endtime < 0)
+        return -ERRINVAL;
     CALL( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
     snprintf(line, sizeof(line), "%" TIME_FILL_ZERO_LEN "d-%" TIME_FILL_ZERO_LEN "d\n", starttime, endtime );
@@ -834,45 +877,78 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
     int starttime = 0, endtime = 0;
     char *line = NULL;
     size_t len = 0;
-    int record_len = 0, i = 0;
-    uint8_t time_buf[8] = {0};
+    int record_len = 0, i = 0, total = 0, ret = -ERRINTERNAL;
+    ioctl_list_event_resp_t *eventlist = NULL;
 
-    CALL( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) );
+    if( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) <0)
+        return -ERRINTERNAL;
+
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
-    if ( get_record_info_in_db(segment_db_file, &record_len, &count) < 0 ) {
+    if ( get_record_info_in_db(segment_db_file, &record_len, &total) < 0 ) {
         LOGE("get record info error");
-        pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
-        goto err;
+        goto err_unlock;
     }
-    CALL( find_location_in_db(segment_db_file, in_starttime, in_endtime, &start_pos, &end_pos) );
-    if ( ( fp = fopen(segment_db_file, "r") ) == NULL ) {
+    LOGI("total:%d", total);
+    LOGI("in_starttime:%d", in_starttime);
+    LOGI("in_endtime:%d", in_endtime);
+    start_pos = find_start_pos(segment_db_file, in_starttime);
+    if (start_pos < 0)
+        goto err_unlock;
+    LOGI("start:%d", start_pos);
+    end_pos = find_end_pos(segment_db_file, in_endtime);
+    if (end_pos < 0)
+        goto err_unlock;
+    LOGI("start:%d end:%d", start_pos, end_pos);
+    if ((fp = fopen(segment_db_file, "r") ) == NULL) {
         LOGE("open file %s error", segment_db_file );
-        goto err;
+        goto err_close_file;
+    }
+    ASSERT(record_len);
+    count = (end_pos - start_pos)/record_len + 1;
+    LOGI("segment count:%d", count);
+    eventlist = (ioctl_list_event_resp_t *)malloc(sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count);
+    if (!eventlist) {
+        LOGE("malloc error");
+        goto err_close_file;
+    }
+    memset(eventlist, 0, sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count);
+    eventlist->total = 1;
+    eventlist->index = 0;
+    eventlist->endflag = 1;
+    eventlist->count = count;
+    if(fseek(fp, start_pos, SEEK_SET) < 0) {
+        LOGE("fseek error");
+        goto err_free_buf;
     }
     for (i = 0; i < count; ++i) {
         if ( getline(&line, &len, fp) < 0 ) {
             LOGE("getline error");
-            goto err;
+            goto err_free_buf;
         }
         if ( !line ) {
             LOGE("get one line segment error");
-            goto err;
+            goto err_free_buf;
         }
-        if( parse_one_record(line, &starttime, &endtime ) < 0 ) {
-            goto err;
-        }
-        *(int*)&time_buf = htonl(starttime);
-        *(int*)(&time_buf + 4) = htonl(endtime);
-        if ( lst_send_data(ch, NULL, 0, time_buf, sizeof(time_buf)) <0 )
-            goto err;
+        if( parse_one_record(line, &starttime, &endtime) < 0 )
+            goto err_free_buf;
+        eventlist->events[i].utc_starttime = starttime;
+        eventlist->events[i].utc_endtime = endtime;
+        eventlist->events[i].event = AVIOCTRL_EVENT_MOTIONDECT;
+        eventlist->events[i].status = 0;
     }
+    if (lst_send_ioctl(
+                ch,
+                LST_USER_IPCAM_LISTEVENT_RESP,
+                (char*)eventlist,
+                sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count) < 0)
+        goto err_free_buf;
+    ret = 0;
+err_free_buf:
+    free(eventlist);
+err_close_file:
+    fclose(fp);
+err_unlock:
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
-
-    return 0;
-err:
-    if (fp) 
-        fclose( fp );
-    pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
-    return -1;
+    return ret;
 }
 
