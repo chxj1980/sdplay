@@ -28,6 +28,7 @@ extern int lst_listen( int timeout );
 extern int lst_create_data_channel( int sid, auth_cb_t cb );
 extern int lst_init(const char *uid, const char *dev_name, const char *passwd);
 extern int lst_login_success();
+extern int lst_send_ioctl(int ch, unsigned int cmd, const char *data, int data_size);
 
 #define _TRANSFER_H
 #endif

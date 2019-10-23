@@ -193,4 +193,16 @@ int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int max_size,
 
     return 0;
 }
+int lst_send_ioctl(int ch, unsigned int cmd, const char *data, int data_size)
+{
+    int ret;
+
+    ret = avSendIOCtrl(ch, cmd, data, data_size);
+    if (ret < 0) {
+        LOGE("avSendIOCtrl error, ret = %d", ret);
+        return -ERRINTERNAL;
+    }
+
+    return 0;
+}
 

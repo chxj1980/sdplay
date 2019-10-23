@@ -119,6 +119,29 @@ typedef struct {
     unsigned char reserved[2];
 } ioctl_list_event_req_t;
 
+typedef struct {
+    time_day_t st_starttime;
+    time_day_t st_endtime;
+    unsigned int utc_starttime;     // UTC Time
+    unsigned int utc_endtime;       // UTC Time
+    unsigned char event;
+    unsigned char status;   // 0x00: Recording file exists, Event unreaded
+                            // 0x01: Recording file exists, Event readed
+                            // 0x02: No Recording file in the event
+    unsigned char reserved[2];
+} av_event_t;
+
+typedef struct {
+    unsigned int channel;       // Camera Index
+    unsigned int total;         // Total event amount in this search session
+    unsigned char index;        // package index, 0,1,2...;
+                                // because avSendIOCtrl() send package up to 1024 bytes one time, you may want split search results to serveral package to send.
+    unsigned char endflag;      // end flag; endFlag = 1 means this package is the last one.
+    unsigned char count;        // how much events in this package
+    unsigned char reserved[1];
+    av_event_t events[1];        // The first memory address of the events in this package
+} ioctl_list_event_resp_t;
+
 static sdplay_info_t g_sdplay_info;
 
 static int auth_callback( char *user, char *passwd )
@@ -133,9 +156,11 @@ static int auth_callback( char *user, char *passwd )
     return 0;
 }
 
-static int list_event_handle(char *data)
+static int list_event_handle(int ch,char *data)
 {
+    int i;
     ioctl_list_event_req_t *req =  (ioctl_list_event_req_t *)data;
+    ioctl_list_event_resp_t *eventlist = NULL;
 
     ASSERT(data);
 
@@ -157,11 +182,24 @@ static int list_event_handle(char *data)
     LOGI("st.endtime.hour = %d", req->st_endtime.hour );
     LOGI("st.endtime.minute = %d", req->st_endtime.minute );
     LOGI("st.endtime.second = %d", req->st_endtime.second );
+    eventlist = (ioctl_list_event_resp_t *)malloc(sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*3);
+    memset(eventlist, 0, sizeof(ioctl_list_event_resp_t));
+    eventlist->total = 1;
+    eventlist->index = 0;
+    eventlist->endflag = 1;
+    eventlist->count = 3;
+    for(i=0;i<eventlist->count;i++) {
+        eventlist->events[i].utc_starttime = 1571801203 - 120 - i*60;
+        eventlist->events[i].utc_endtime = 1571801203 - i*60;
+        eventlist->events[i].event = AVIOCTRL_EVENT_MOTIONDECT;
+        eventlist->events[i].status = 0;
+    }
+    lst_send_ioctl(ch, LST_USER_IPCAM_LISTEVENT_RESP, (char*)eventlist, sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*3);
 
     return 0;
 }
 
-static int cmd_handle(int cmd, char *data)
+static int cmd_handle(int ch, int cmd, char *data)
 {
     switch(cmd) {
         case LST_USER_IPCAM_RECORD_PLAYCONTROL:
@@ -169,7 +207,7 @@ static int cmd_handle(int cmd, char *data)
             break;
         case LST_USER_IPCAM_LISTEVENT_REQ:
             LOGI("LST_USER_IPCAM_LISTEVENT_REQ");
-            if (list_event_handle(data) < 0)
+            if (list_event_handle(ch, data) < 0)
                 goto err;
             break;
         case LST_START_PLAY:
@@ -207,7 +245,7 @@ static void *ioctl_thread(void *arg)
                 continue;
             return NULL;
         }
-        if (cmd_handle(cmd, data) < 0 ) {
+        if (cmd_handle(ch, cmd, data) < 0 ) {
             LOGE("cmd_handle error");
             return NULL;
         }
@@ -832,7 +870,8 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
 
     return 0;
 err:
-    if (fp) fclose( fp );
+    if (fp) 
+        fclose( fp );
     pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
     return -1;
 }
