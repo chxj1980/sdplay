@@ -29,10 +29,11 @@ extern int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int ma
 extern int lst_send_data( int ch, uint8_t *header, int hdr_len, uint8_t *data, int len);
 extern int lst_listen( int timeout );
 extern int lst_create_data_channel( int sid, auth_cb_t cb );
-extern int lst_init(const char *uid, const char *dev_name, const char *passwd);
+extern int lst_init(const char *uid, const char *dev_name, const char *passwd, int max_client_num);
 extern int lst_login_success();
 extern int lst_send_ioctl(int ch, unsigned int cmd, const char *data, int data_size);
 extern int lst_create_data_channel2(int sid, const char *user, const char *passwd, int free_ch);
+extern int lst_session_get_free_channel(int sid);
 
 #define _TRANSFER_H
 #endif

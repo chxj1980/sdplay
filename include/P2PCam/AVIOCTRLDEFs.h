@@ -734,25 +734,32 @@ IOTYPE_USER_IPCAM_LISTEVENT_REQ			= 0x0318,
 */
 typedef struct
 {
-	unsigned int channel; 		// Camera Index
-	STimeDay stStartTime; 		// Search event from ...
-	STimeDay stEndTime;	  		// ... to (search event)
-	unsigned char event;  		// event type, refer to ENUM_EVENTTYPE
-	unsigned char status; 		// 0x00: Recording file exists, Event unreaded
-								// 0x01: Recording file exists, Event readed
-								// 0x02: No Recording file in the event
-	unsigned char reserved[2];
+    unsigned int channel;       // Camera Index
+    STimeDay stStartTime;       // Search event from ...
+    STimeDay stEndTime;         // ... to (search event)
+    unsigned int utcStartTime;  // utc time Search event from ...
+    unsigned int utcEndTime;    // utc time ... to (search event)
+    unsigned char event;        // event type, refer to ENUM_EVENTTYPE
+    unsigned char status;       // 0x00: Recording file exists, Event unreaded
+                                // 0x01: Recording file exists, Event readed
+                                // 0x02: No Recording file in the event
+    unsigned char reserved[2];
+
 }SMsgAVIoctrlListEventReq;
 
 
 typedef struct
 {
-	STimeDay stTime;
-	unsigned char event;
-	unsigned char status;	// 0x00: Recording file exists, Event unreaded
-							// 0x01: Recording file exists, Event readed
-							// 0x02: No Recording file in the event
-	unsigned char reserved[2];
+    STimeDay stStartTime;
+    STimeDay stEndTime;
+    unsigned int utcStartTime;     // UTC Time
+    unsigned int utcEndTime;       // UTC Time
+    unsigned char event;
+    unsigned char status;   // 0x00: Recording file exists, Event unreaded
+                            // 0x01: Recording file exists, Event readed
+                            // 0x02: No Recording file in the event
+    unsigned char reserved[2];
+
 }SAvEvent;
 	
 /*

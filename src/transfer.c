@@ -19,7 +19,6 @@
 #include "dbg.h"
 #include "public.h"
 
-#define MAX_CLIENT_NUMBER       128
 #define MAX_SIZE_IOCTRL_BUF     1024
 
 typedef struct {
@@ -69,7 +68,7 @@ int lst_login_success()
     return g_lst_info.login_success;
 }
 
-int lst_init(const char *uid, const char *dev_name, const char *passwd)
+int lst_init(const char *uid, const char *dev_name, const char *passwd, int max_client_num)
 {
     int ret = 0;
 
@@ -81,14 +80,14 @@ int lst_init(const char *uid, const char *dev_name, const char *passwd)
     g_lst_info.dev_name = strdup(dev_name);
     g_lst_info.passwd = strdup(passwd);
 
-    IOTC_Set_Max_Session_Number(MAX_CLIENT_NUMBER);
+    IOTC_Set_Max_Session_Number(max_client_num);
     ret = IOTC_Initialize2(0);
     if(ret != IOTC_ER_NoERROR) {
         LOGE("IOTC_Initialize2(), ret=[%d]\n", ret);
         return -1;
     }
     IOTC_Get_Login_Info_ByCallBackFn( login_cb );
-    avInitialize( MAX_CLIENT_NUMBER*3 );
+    avInitialize(max_client_num*3);
     pthread_create( &g_lst_info.login_tid, NULL, login_thread, NULL );
 
     return 0;
@@ -220,5 +219,10 @@ int lst_create_data_channel2(int sid, const char *user, const char *passwd, int 
     LOGI("ch:%d", ch);
 
     return ch;
+}
+
+int lst_session_get_free_channel(int sid)
+{
+    return(IOTC_Session_Get_Free_Channel(sid));
 }
 

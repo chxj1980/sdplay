@@ -14,7 +14,7 @@ extern int sdp_init( const char *ts_path,
         const char *sd_mount_path,
         const char *uid,
         const char *dev_name,
-        const char *passwd );
+        const char *passwd);
 extern int sdp_save_ts(const uint8_t *ts_buf, size_t size, int starttime, int endtime);
 extern int sdp_save_segment_info(int starttime, int endtime);
 extern int sdp_send_segment_list(int ch, int in_starttime, int in_endtime);

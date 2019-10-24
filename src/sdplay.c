@@ -25,9 +25,6 @@
 #include "public.h"
 
 #define SDPLAY_DBG 0
-
-#define PARAM_CHECK_AND_RETURN( cond )  if ( !(cond) ) { LOGE("check "#cond" error"); return -1; }
-#define PTR_CHECK_AND_RETURN( ptr ) if ( !(ptr) ) { LOGE("check pointer "#ptr" error"); return -1; }
 #define INDEX_DB "tsindexdb"
 #define SEGMENT_DB_FILENAME "segmentdb"
 #define INDEX_DB_TMP "tsindexdb.tmp"
@@ -43,12 +40,7 @@
 #define SEGMENT_RECORD_LEN (TIME_IN_SEC_LEN*2+1+1+1)
 #define MAX_PKT_SIZE (1024*1024) /*  avServSetResendSize()函数最大发送为 1024KB 字节  */
 #define TS_MD5_LEN 33
-#define MAX_CHANNEL 8
-
-enum {
-    FIND_START = 1,
-    FIND_END
-};
+#define MAX_CLIENT_NUM 8
 
 enum {
     JUDGE_CURRENT = 1,
@@ -58,61 +50,20 @@ enum {
 };
 
 typedef struct {
+    int av_index;
+    int playback_ch;
+} av_client_t;
+
+typedef struct {
     const char *ts_path;
     const char *sd_mount_path;
     int ts_delete_count_when_full;
-    int channels[MAX_CHANNEL];
     int active_ch_num;
     int running;
     pthread_mutex_t mutex;
     pthread_mutex_t segment_db_mutex;
+    av_client_t clients[MAX_CLIENT_NUM];
 } sdplay_info_t;
-
-typedef struct {
-    unsigned short year;    // The number of year.
-    unsigned char month;    // The number of months since January, in the range 1 to 12.
-    unsigned char day;      // The day of the month, in the range 1 to 31.
-    unsigned char wday;     // The number of days since Sunday, in the range 0 to 6. (Sunday = 0, Monday = 1, ...)
-    unsigned char hour;     // The number of hours past midnight, in the range 0 to 23.
-    unsigned char minute;   // The number of minutes after the hour, in the range 0 to 59.
-    unsigned char second;   // The number of seconds after the minute, in the range 0 to 59.
-} time_day_t;
-
-typedef struct {
-    unsigned int channel;       // Camera Index
-    time_day_t st_starttime;       // Search event from ...
-    time_day_t st_endtime;         // ... to (search event)
-    unsigned int utc_starttime;  // utc time Search event from ...
-    unsigned int utc_endtime;    // utc time ... to (search event)
-    unsigned char event;        // event type, refer to ENUM_EVENTTYPE
-    unsigned char status;       // 0x00: Recording file exists, Event unreaded
-                                // 0x01: Recording file exists, Event readed
-                                // 0x02: No Recording file in the event
-    unsigned char reserved[2];
-} ioctl_list_event_req_t;
-
-typedef struct {
-    time_day_t st_starttime;
-    time_day_t st_endtime;
-    unsigned int utc_starttime;     // UTC Time
-    unsigned int utc_endtime;       // UTC Time
-    unsigned char event;
-    unsigned char status;   // 0x00: Recording file exists, Event unreaded
-                            // 0x01: Recording file exists, Event readed
-                            // 0x02: No Recording file in the event
-    unsigned char reserved[2];
-} av_event_t;
-
-typedef struct {
-    unsigned int channel;       // Camera Index
-    unsigned int total;         // Total event amount in this search session
-    unsigned char index;        // package index, 0,1,2...;
-                                // because avSendIOCtrl() send package up to 1024 bytes one time, you may want split search results to serveral package to send.
-    unsigned char endflag;      // end flag; endFlag = 1 means this package is the last one.
-    unsigned char count;        // how much events in this package
-    unsigned char reserved[1];
-    av_event_t events[1];        // The first memory address of the events in this package
-} ioctl_list_event_resp_t;
 
 typedef struct {
     unsigned int index;        /* package index, 0,1,2...;
@@ -124,7 +75,7 @@ typedef struct {
     unsigned int length;       /* file size */
     unsigned char md5_str[33]; /* md5 校验 */
     unsigned char reserved[3];
-} TAGFrame_Head_t;
+} tag_frame_header_t;
 
 static int get_record_info_in_db(const char *db_file, int *out_record_len, int *total_record_count);
 static int read_file_to_buf(const char *file, uint8_t **outbuf, int *outsize);
@@ -147,66 +98,72 @@ static int auth_callback( char *user, char *passwd )
 
 static int list_event_handle(int ch,char *data)
 {
-    int i;
-    ioctl_list_event_req_t *req =  (ioctl_list_event_req_t *)data;
-    ioctl_list_event_resp_t *eventlist = NULL;
+    SMsgAVIoctrlListEventReq *req = (SMsgAVIoctrlListEventReq *)data;
 
     ASSERT(data);
 
     LOGI("event:%d", req->event);
     LOGI("channel:%d",req->channel);
     LOGI("status:%d",req->status);
-    LOGI("starttime:%d", req->utc_starttime);
-    LOGI("endtime:%d", req->utc_endtime);
+    LOGI("starttime:%d", req->utcStartTime);
+    LOGI("endtime:%d", req->utcEndTime);
 
-    if (sdp_send_segment_list(ch, req->utc_starttime, req->utc_endtime) < 0)
+    if (sdp_send_segment_list(ch, req->utcStartTime, req->utcEndTime) < 0)
         return -ERRINTERNAL;
 
     return 0;
+}
+
+static void *tslist_playback_thread(void *arg)
+{
+    int sid = (int)arg;
+    int av_index = lst_create_data_channel2(sid, "admin", "123456", g_sdplay_info.clients[sid].playback_ch);
+    SMsgAVIoctrlPlayRecordResp res;
+
+    if (av_index < 0)
+        return NULL;
+    // TODO 
+    // 1.search all the ts
+    // 2.send to app
+
+    res.command = AVIOCTRL_RECORD_PLAY_END;
+    if (lst_send_ioctl(
+                av_index, 
+                LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP,
+                (const char *)&res,
+                sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
+        return NULL;
+    LOGI("send AVIOCTRL_RECORD_PLAY_END");
+
+    return NULL;
 }
 
 static int playcontrol_handle(int sid, int ch, char *data)
 {
     SMsgAVIoctrlPlayRecord *req = (SMsgAVIoctrlPlayRecord *)data;
     SMsgAVIoctrlPlayRecordResp res;
+    pthread_t tid;
 
     LOGI("cmd:%d",req->command);
     LOGI("utctime:%d", req->utcTime);
 
-    FILE *fp = fopen("test.ts", "r");
-    int filesize = get_file_size("test.ts");
-    uint8_t *buf_ptr = NULL;
-    int len = 0;
-    TAGFrame_Head_t header;
-    int free_ch = 0;
-    int ch2 = 0;
-
-    free_ch = IOTC_Session_Get_Free_Channel(sid);
     res.command = AVIOCTRL_RECORD_PLAY_START;
-    res.result = free_ch;
-    LOGI("send AVIOCTRL_RECORD_PLAY_START");
-    if (lst_send_ioctl(ch, LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP, (const char *)&res, sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
-        return -ERRINTERNAL;
-    ch2 = lst_create_data_channel2(sid, "admin", "123456", free_ch);
-    if (ch2 < 0)
-        return -ERRINTERNAL;
-
-    if (read_file_to_buf("test.ts", &buf_ptr, &len) < 0)
-        return -ERRINTERNAL;
-    header.index = 0;
-    header.endflag = 1;
-    header.utctime = 1571899684;
-    header.length = filesize;
-    LOGI("filesize:%d", filesize);
-    if (calc_ts_md5( buf_ptr, filesize, (char *)header.md5_str) < 0)
-        return -ERRINTERNAL;
-    if (lst_send_data(ch2, (uint8_t *)&header, sizeof(TAGFrame_Head_t), buf_ptr, filesize) < 0)
-        return -ERRINTERNAL;
-    LOGI("send data ok");
-    res.command = AVIOCTRL_RECORD_PLAY_END;
-    if (lst_send_ioctl(ch2, LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP, (const char *)&res, sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
-        return -ERRINTERNAL;
-    LOGI("send AVIOCTRL_RECORD_PLAY_END");
+    if (req->command == AVIOCTRL_RECORD_PLAY_START){
+        if (g_sdplay_info.clients[sid].playback_ch < 0) {
+            g_sdplay_info.clients[sid].playback_ch = lst_session_get_free_channel(sid);
+            res.result = g_sdplay_info.clients[sid].playback_ch;
+        } else
+            res.result = -1;
+        if (res.result >= 0) {
+            pthread_create(&tid, NULL, tslist_playback_thread, (void *)(uintptr_t)sid);
+        }
+        if (lst_send_ioctl(
+                    ch,
+                    LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP,
+                    (const char *)&res,
+                    sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
+            return -ERRINTERNAL;
+    }
 
     return 0;
 }
@@ -249,6 +206,7 @@ static void *ioctl_thread(void *arg)
 
     if ((ch = lst_create_data_channel(sid, auth_callback )) < 0)
         return NULL;
+    g_sdplay_info.clients[sid].av_index = ch;
     while( g_sdplay_info.running ) {
         unsigned int cmd = 0;
         char data[1024] = {0};
@@ -300,9 +258,10 @@ int sdp_init( const char *ts_path,
         const char *sd_mount_path,
         const char *uid,
         const char *dev_name,
-        const char *passwd )
+        const char *passwd)
 {
     pthread_t tid;
+    int i = 0;
 
     ASSERT( ts_path );
     ASSERT( sd_mount_path );
@@ -310,13 +269,16 @@ int sdp_init( const char *ts_path,
     ASSERT( dev_name );
     ASSERT( passwd );
 
+    for (i=0; i<MAX_CLIENT_NUM; i++) {
+        g_sdplay_info.clients[i].playback_ch = -1;
+    }
     g_sdplay_info.running = 1;
     g_sdplay_info.ts_path = strdup(ts_path);
     g_sdplay_info.sd_mount_path = strdup(sd_mount_path);
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
     pthread_mutex_init( &g_sdplay_info.mutex, NULL );
     pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
-    lst_init( uid, dev_name, passwd );
+    lst_init( uid, dev_name, passwd, MAX_CLIENT_NUM );
     pthread_create(&tid, NULL, sdplay_thread, NULL);
 
     return 0;
@@ -905,7 +867,7 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
     char *line = NULL;
     size_t len = 0;
     int record_len = 0, i = 0, total = 0, ret = -ERRINTERNAL;
-    ioctl_list_event_resp_t *eventlist = NULL;
+    SMsgAVIoctrlListEventResp *eventlist = NULL;
 
     if( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) <0)
         return -ERRINTERNAL;
@@ -933,12 +895,12 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
     ASSERT(record_len);
     count = (end_pos - start_pos)/record_len + 1;
     LOGI("segment count:%d", count);
-    eventlist = (ioctl_list_event_resp_t *)malloc(sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count);
+    eventlist = (SMsgAVIoctrlListEventResp *)malloc(sizeof(SMsgAVIoctrlListEventResp)+sizeof(SAvEvent)*count);
     if (!eventlist) {
         LOGE("malloc error");
         goto err_close_file;
     }
-    memset(eventlist, 0, sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count);
+    memset(eventlist, 0, sizeof(SMsgAVIoctrlListEventResp)+sizeof(SAvEvent)*count);
     eventlist->total = 1;
     eventlist->index = 0;
     eventlist->endflag = 1;
@@ -958,16 +920,16 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
         }
         if( parse_one_record(line, &starttime, &endtime) < 0 )
             goto err_free_buf;
-        eventlist->events[i].utc_starttime = starttime;
-        eventlist->events[i].utc_endtime = endtime;
-        eventlist->events[i].event = AVIOCTRL_EVENT_MOTIONDECT;
-        eventlist->events[i].status = 0;
+        eventlist->stEvent[i].utcStartTime = starttime;
+        eventlist->stEvent[i].utcEndTime = endtime;
+        eventlist->stEvent[i].event = AVIOCTRL_EVENT_MOTIONDECT;
+        eventlist->stEvent[i].status = 0;
     }
     if (lst_send_ioctl(
                 ch,
                 LST_USER_IPCAM_LISTEVENT_RESP,
                 (char*)eventlist,
-                sizeof(ioctl_list_event_resp_t)+sizeof(av_event_t)*count) < 0)
+                sizeof(SMsgAVIoctrlListEventResp)+sizeof(SAvEvent)*count) < 0)
         goto err_free_buf;
     ret = 0;
 err_free_buf:
