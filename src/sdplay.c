@@ -200,7 +200,7 @@ static int playcontrol_handle(int sid, int ch, char *data)
     LOGI("filesize:%d", filesize);
     if (calc_ts_md5( buf_ptr, filesize, (char *)header.md5_str) < 0)
         return -ERRINTERNAL;
-    if (lst_send_data(ch, (uint8_t *)&header, sizeof(TAGFrame_Head_t), buf_ptr, filesize) < 0)
+    if (lst_send_data(ch2, (uint8_t *)&header, sizeof(TAGFrame_Head_t), buf_ptr, filesize) < 0)
         return -ERRINTERNAL;
     LOGI("send data ok");
     res.command = AVIOCTRL_RECORD_PLAY_END;
