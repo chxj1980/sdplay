@@ -782,6 +782,7 @@ typedef struct
 	unsigned int command;	// play record command. refer to ENUM_PLAYCONTROL
 	unsigned int Param;		// command param, that the user defined
 	STimeDay stTimeDay;		// Event time from ListEvent
+    unsigned int utcTime;   // Event utc time from ListEvent
 	unsigned char reserved[4];
 } SMsgAVIoctrlPlayRecord;
 

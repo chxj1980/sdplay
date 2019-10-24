@@ -100,7 +100,7 @@ int lst_send_data( int ch, uint8_t *header, int hdr_len, uint8_t *data, int len)
 
     ret = avSendFrameData( ch, (const char *)data, len, (void *)header, hdr_len );
     if ( ret < 0 ) {
-        LOGE("avSendFrameData error");
+        LOGE("avSendFrameData error,ret = %d", ret);
         return -1;
     }
 
@@ -131,6 +131,7 @@ int lst_create_data_channel( int sid, auth_cb_t cb )
         IOTC_Session_Close(sid);
         return -1;
     }
+    avServSetResendSize(index, 1024*1024);
 
     if( IOTC_Session_Check(sid, &s_info) == IOTC_ER_NoERROR ) {
         char *mode[3] = {"P2P", "RLY", "LAN"};
@@ -204,5 +205,20 @@ int lst_send_ioctl(int ch, unsigned int cmd, const char *data, int data_size)
     }
 
     return 0;
+}
+
+int lst_create_data_channel2(int sid, const char *user, const char *passwd, int free_ch)
+{
+    int ch = 0;
+
+    LOGI("free_ch:%d", free_ch);
+    ch = avServStart(sid, user, passwd, 0, 0, free_ch);
+    if (ch < 0) {
+        LOGE("avServStart error");
+        return -ERRINTERNAL;
+    }
+    LOGI("ch:%d", ch);
+
+    return ch;
 }
 

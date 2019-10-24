@@ -5,22 +5,6 @@
 *         sdp : sd play
 * @date 二 10/ 8 12:16:19 2019
 */
-
-/*
- * 1.删除策略 √
- *      1.1 检查sd卡是否满了
- * 2.tutk传输 √
- *      2.1 引入中间层
- * 3.片段信息保存 √
- * 4.片段信息发送 √
- * 5.测试计划
- *      5.1 ts的存储
- * 6.一些之前gos的信令，比如sd卡格式化,获取设备状态等
- * 7.有些地方操作文件没有加锁 √
- * 8.回放支持多通道
- * 9.tutk信令部分
- * */
-
 #include <stdio.h>
 #include <errno.h>
 #include <unistd.h>
@@ -72,26 +56,6 @@ enum {
     JUDGE_LEFT,
     JUDGE_RIGHT
 };
-
-typedef enum {
-    AVIOCTRL_EVENT_ALL = 0x00,          // all event type(general APP-->IPCamera)
-    AVIOCTRL_EVENT_MOTIONDECT = 0x01,   // motion detect start//==s==
-    AVIOCTRL_EVENT_VIDEOLOST = 0x02,    // video lost alarm
-    AVIOCTRL_EVENT_IOALARM = 0x03,      // io alarmin start //---s--
-    AVIOCTRL_EVENT_MOTIONPASS = 0x04,   // motion detect end  //==e==
-    AVIOCTRL_EVENT_VIDEORESUME = 0x05,  // video resume
-    AVIOCTRL_EVENT_IOALARMPASS = 0x06,  // IO alarmin end   //---e--
-    AVIOCTRL_EVENT_MOVIE = 0x07,
-    AVIOCTRL_EVENT_TIME_LAPSE = 0x08,
-    AVIOCTRL_EVENT_EMERGENCY = 0x09,
-    AVIOCTRL_EVENT_EXPT_REBOOT = 0x10,  // system exception reboot
-    AVIOCTRL_EVENT_SDFAULT = 0x11,      // sd record exception
-    AVIOCTRL_EVENT_FULLTIME_RECORDING = 0x12,
-    AVIOCTRL_EVENT_PIR = 0x13,
-    AVIOCTRL_EVENT_RINGBELL = 0x14,
-    AVIOCTRL_EVENT_SOUND = 0x15,
-} ENUM_EVENTTYPE;
-
 
 typedef struct {
     const char *ts_path;
@@ -150,7 +114,22 @@ typedef struct {
     av_event_t events[1];        // The first memory address of the events in this package
 } ioctl_list_event_resp_t;
 
+typedef struct {
+    unsigned int index;        /* package index, 0,1,2...;
+                                * avServSetResendSize()函数最大发送为
+                                * 1024KB 字节，index 表示拆分发送的索引
+                                */
+    unsigned int endflag;      /* endFlag=1 时表示当前TS文件最后一个片段 */
+    unsigned int utctime;      /* app 定位时间 */
+    unsigned int length;       /* file size */
+    unsigned char md5_str[33]; /* md5 校验 */
+    unsigned char reserved[3];
+} TAGFrame_Head_t;
+
 static int get_record_info_in_db(const char *db_file, int *out_record_len, int *total_record_count);
+static int read_file_to_buf(const char *file, uint8_t **outbuf, int *outsize);
+static int calc_ts_md5( uint8_t *inbuf, size_t inlen, char *outbuf );
+static int get_file_size( const char *file );
 
 static sdplay_info_t g_sdplay_info;
 
@@ -186,11 +165,59 @@ static int list_event_handle(int ch,char *data)
     return 0;
 }
 
-static int cmd_handle(int ch, int cmd, char *data)
+static int playcontrol_handle(int sid, int ch, char *data)
+{
+    SMsgAVIoctrlPlayRecord *req = (SMsgAVIoctrlPlayRecord *)data;
+    SMsgAVIoctrlPlayRecordResp res;
+
+    LOGI("cmd:%d",req->command);
+    LOGI("utctime:%d", req->utcTime);
+
+    FILE *fp = fopen("test.ts", "r");
+    int filesize = get_file_size("test.ts");
+    uint8_t *buf_ptr = NULL;
+    int len = 0;
+    TAGFrame_Head_t header;
+    int free_ch = 0;
+    int ch2 = 0;
+
+    free_ch = IOTC_Session_Get_Free_Channel(sid);
+    res.command = AVIOCTRL_RECORD_PLAY_START;
+    res.result = free_ch;
+    LOGI("send AVIOCTRL_RECORD_PLAY_START");
+    if (lst_send_ioctl(ch, LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP, (const char *)&res, sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
+        return -ERRINTERNAL;
+    ch2 = lst_create_data_channel2(sid, "admin", "123456", free_ch);
+    if (ch2 < 0)
+        return -ERRINTERNAL;
+
+    if (read_file_to_buf("test.ts", &buf_ptr, &len) < 0)
+        return -ERRINTERNAL;
+    header.index = 0;
+    header.endflag = 1;
+    header.utctime = 1571899684;
+    header.length = filesize;
+    LOGI("filesize:%d", filesize);
+    if (calc_ts_md5( buf_ptr, filesize, (char *)header.md5_str) < 0)
+        return -ERRINTERNAL;
+    if (lst_send_data(ch, (uint8_t *)&header, sizeof(TAGFrame_Head_t), buf_ptr, filesize) < 0)
+        return -ERRINTERNAL;
+    LOGI("send data ok");
+    res.command = AVIOCTRL_RECORD_PLAY_END;
+    if (lst_send_ioctl(ch2, LST_USER_IPCAM_RECORD_PLAYCONTROL_RESP, (const char *)&res, sizeof(SMsgAVIoctrlPlayRecordResp)) < 0)
+        return -ERRINTERNAL;
+    LOGI("send AVIOCTRL_RECORD_PLAY_END");
+
+    return 0;
+}
+
+static int cmd_handle(int sid, int ch, int cmd, char *data)
 {
     switch(cmd) {
         case LST_USER_IPCAM_RECORD_PLAYCONTROL:
             LOGI("LST_USER_IPCAM_RECORD_PLAYCONTROL");
+            if (playcontrol_handle(sid, ch, data) < 0)
+                goto err;
             break;
         case LST_USER_IPCAM_LISTEVENT_REQ:
             LOGI("LST_USER_IPCAM_LISTEVENT_REQ");
@@ -232,7 +259,7 @@ static void *ioctl_thread(void *arg)
                 continue;
             return NULL;
         }
-        if (cmd_handle(ch, cmd, data) < 0 ) {
+        if (cmd_handle(sid, ch, cmd, data) < 0 ) {
             return NULL;
         }
     }
