@@ -22,6 +22,7 @@ enum {
 };
 
 #define LST_ERR_TIMEOUT -2
+#define LST_ERR_SESSION_CLOSE_BY_REMOTE -3
 
 typedef int (*auth_cb_t)( char *user, char *passwd );
 

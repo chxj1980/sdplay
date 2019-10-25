@@ -25,7 +25,7 @@
 #include "public.h"
 
 #define SDPLAY_DBG 0
-#define INDEX_DB "tsindexdb"
+#define TS_INDEX_DB "tsindexdb"
 #define SEGMENT_DB_FILENAME "segmentdb"
 #define INDEX_DB_TMP "tsindexdb.tmp"
 #define LENGTH_PER_RECORD 64
@@ -49,18 +49,28 @@ enum {
     JUDGE_RIGHT
 };
 
+enum {
+    PLAYBACK_STS_PLAY,
+    PLAYBACK_STS_PAUSE,
+    PLAYBACK_STS_STOP,
+};
+
 typedef struct {
     int av_index;
     int playback_ch;
+    int playback_sts;
 } av_client_t;
 
 typedef struct {
-    const char *ts_path;
     const char *sd_mount_path;
+    const char *user;
+    const char *passwd;
+    char *ts_dbfile;
+    char *segment_dbfile;
     int ts_delete_count_when_full;
     int active_ch_num;
     int running;
-    pthread_mutex_t mutex;
+    pthread_mutex_t ts_db_mutex;
     pthread_mutex_t segment_db_mutex;
     av_client_t clients[MAX_CLIENT_NUM];
 } sdplay_info_t;
@@ -77,10 +87,18 @@ typedef struct {
     unsigned char reserved[3];
 } tag_frame_header_t;
 
+typedef struct {
+    int sid;
+    int starttime;
+} playback_info_t;
+
 static int get_record_info_in_db(const char *db_file, int *out_record_len, int *total_record_count);
 static int read_file_to_buf(const char *file, uint8_t **outbuf, int *outsize);
 static int calc_ts_md5( uint8_t *inbuf, size_t inlen, char *outbuf );
 static int get_file_size( const char *file );
+static int find_start_pos(char *db_file, int starttime);
+static int send_ts(int ch, const char *ts_file, int starttime, int endtime);
+static inline int parse_one_record(char *record, int *starttime, int *endtime);
 
 static sdplay_info_t g_sdplay_info;
 
@@ -89,8 +107,8 @@ static int auth_callback( char *user, char *passwd )
     ASSERT( user );
     ASSERT( passwd );
 
-    if ( strncmp(user, "admin", 5) == 0
-            && strncmp(passwd, "12345", 5) == 0 ) 
+    if ( strncmp(user, g_sdplay_info.user, strlen(g_sdplay_info.user)) == 0
+            && strncmp(passwd, g_sdplay_info.passwd, strlen(g_sdplay_info.passwd)) == 0 ) 
         return 1;
 
     return 0;
@@ -116,15 +134,38 @@ static int list_event_handle(int ch,char *data)
 
 static void *tslist_playback_thread(void *arg)
 {
-    int sid = (int)arg;
-    int av_index = lst_create_data_channel2(sid, "admin", "123456", g_sdplay_info.clients[sid].playback_ch);
+    playback_info_t *playback_info_ptr = (playback_info_t *)arg;
+    int sid = playback_info_ptr->sid;
+    int start_pos = 0;
+    int av_index = lst_create_data_channel2(sid, g_sdplay_info.user, g_sdplay_info.passwd, g_sdplay_info.clients[sid].playback_ch);
     SMsgAVIoctrlPlayRecordResp res;
+    FILE *fp = NULL;
+    char *line = NULL;
+    size_t len = 0;
+    int ts_starttime = 0, ts_endtime = 0;
 
     if (av_index < 0)
         return NULL;
-    // TODO 
-    // 1.search all the ts
-    // 2.send to app
+    pthread_mutex_lock(&g_sdplay_info.ts_db_mutex);
+    fp = fopen(g_sdplay_info.ts_dbfile, "r");
+    if (!fp) {
+        LOGE("open file %s error", g_sdplay_info.ts_dbfile);
+        return NULL;
+    }
+    start_pos = find_start_pos(g_sdplay_info.ts_dbfile, playback_info_ptr->starttime);
+    if (start_pos < 0)
+        goto err_unlock;
+    while(g_sdplay_info.clients[sid].playback_sts == PLAYBACK_STS_PLAY) {
+        if (getline(&line, &len, fp) < 0 ) {
+            LOGE("getline error");
+            goto err_unlock;
+        }
+        if (parse_one_record(line, &ts_starttime, &ts_endtime) < 0)
+            goto err_free;
+        if (send_ts(av_index, line, ts_starttime, ts_endtime) < 0)
+            goto err_free;
+        free(line);
+    }
 
     res.command = AVIOCTRL_RECORD_PLAY_END;
     if (lst_send_ioctl(
@@ -135,6 +176,11 @@ static void *tslist_playback_thread(void *arg)
         return NULL;
     LOGI("send AVIOCTRL_RECORD_PLAY_END");
 
+err_free:
+    free(line);
+err_unlock:
+    pthread_mutex_unlock(&g_sdplay_info.ts_db_mutex);
+    fclose(fp);
     return NULL;
 }
 
@@ -143,6 +189,7 @@ static int playcontrol_handle(int sid, int ch, char *data)
     SMsgAVIoctrlPlayRecord *req = (SMsgAVIoctrlPlayRecord *)data;
     SMsgAVIoctrlPlayRecordResp res;
     pthread_t tid;
+    playback_info_t *playback_info_ptr;
 
     LOGI("cmd:%d",req->command);
     LOGI("utctime:%d", req->utcTime);
@@ -155,7 +202,12 @@ static int playcontrol_handle(int sid, int ch, char *data)
         } else
             res.result = -1;
         if (res.result >= 0) {
-            pthread_create(&tid, NULL, tslist_playback_thread, (void *)(uintptr_t)sid);
+            playback_info_ptr = (playback_info_t *)calloc(1, sizeof(playback_info_t));
+            if (!playback_info_ptr)
+                return -ERRNOMEM;
+            playback_info_ptr->sid = sid;
+            playback_info_ptr->starttime = req->utcTime;
+            pthread_create(&tid, NULL, tslist_playback_thread, (void *)playback_info_ptr);
         }
         if (lst_send_ioctl(
                     ch,
@@ -248,12 +300,6 @@ static void *sdplay_thread(void *arg)
     return NULL;
 }
 
-static inline int get_db_filename( char *out_db_filename, int buflen )
-{
-    snprintf( out_db_filename, buflen, "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
-    return 0;
-}
-
 int sdp_init( const char *ts_path,
         const char *sd_mount_path,
         const char *uid,
@@ -272,11 +318,20 @@ int sdp_init( const char *ts_path,
     for (i=0; i<MAX_CLIENT_NUM; i++) {
         g_sdplay_info.clients[i].playback_ch = -1;
     }
+    g_sdplay_info.ts_dbfile = (char *)calloc(1, strlen(ts_path)+strlen(TS_INDEX_DB)+2);
+    if ( !g_sdplay_info.ts_dbfile)
+        return -ERRNOMEM;
+    sprintf(g_sdplay_info.ts_dbfile, "%s/%s", ts_path, TS_INDEX_DB);
+    g_sdplay_info.segment_dbfile = (char*)calloc(1, strlen(ts_path)+strlen(SEGMENT_DB_FILENAME)+2);
+    if (!g_sdplay_info.segment_dbfile)
+        return -ERRNOMEM;
+    sprintf(g_sdplay_info.segment_dbfile, "%s/%s", ts_path, SEGMENT_DB_FILENAME);
     g_sdplay_info.running = 1;
-    g_sdplay_info.ts_path = strdup(ts_path);
     g_sdplay_info.sd_mount_path = strdup(sd_mount_path);
+    g_sdplay_info.user = strdup(dev_name);
+    g_sdplay_info.passwd = strdup(passwd);
     g_sdplay_info.ts_delete_count_when_full = DELETE_TS_COUNT;
-    pthread_mutex_init( &g_sdplay_info.mutex, NULL );
+    pthread_mutex_init( &g_sdplay_info.ts_db_mutex, NULL );
     pthread_mutex_init( &g_sdplay_info.segment_db_mutex, NULL );
     lst_init( uid, dev_name, passwd, MAX_CLIENT_NUM );
     pthread_create(&tid, NULL, sdplay_thread, NULL);
@@ -308,24 +363,22 @@ static int get_sd_free_space(unsigned long long *free_space)
 static int add_record_to_index_db( const char *ts_name )
 {
     FILE *fp = NULL;
-    char db_file[256] = { 0 };
 
     ASSERT( ts_name );
-    ASSERT( g_sdplay_info.ts_path );
+    ASSERT( g_sdplay_info.ts_dbfile );
 
     LOGI("called");
 
-    snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
-    pthread_mutex_lock( &g_sdplay_info.mutex );
-    if ( (fp = fopen( db_file, "a" )) == NULL ) {
-        LOGE("open file %s error", db_file);
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
+    pthread_mutex_lock( &g_sdplay_info.ts_db_mutex );
+    if ( (fp = fopen(g_sdplay_info.ts_dbfile, "a")) == NULL ) {
+        LOGE("open file %s error", g_sdplay_info.ts_dbfile);
+        pthread_mutex_unlock( &g_sdplay_info.ts_db_mutex );
         return -1;
     }
     fwrite(ts_name, strlen(ts_name), 1, fp);
     fwrite("\n", 1, 1, fp);
     fclose(fp);
-    pthread_mutex_unlock( &g_sdplay_info.mutex );
+    pthread_mutex_unlock( &g_sdplay_info.ts_db_mutex );
 
     return 0;
 }
@@ -337,30 +390,28 @@ static int remove_records_from_index_db()
     size_t len = 0;
     ssize_t read = 0;
     FILE *fp_old = NULL, *fp_new = NULL;
-    char db_file[256] = { 0 };
     char new_db_file[256] = { 0 };
     struct stat stat_buf;
 
-    ASSERT( g_sdplay_info.ts_path );
+    ASSERT( g_sdplay_info.ts_dbfile );
     LOGI("called");
 
-    snprintf( db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB );
-    snprintf( new_db_file, sizeof(db_file), "%s/%s", g_sdplay_info.ts_path, INDEX_DB_TMP );
-    pthread_mutex_lock( &g_sdplay_info.mutex );
-    if( stat(db_file, &stat_buf) != 0 ) {
-        LOGE("get file %s stat error", db_file );
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
+    snprintf( new_db_file, sizeof(new_db_file), "/tmp/%s", INDEX_DB_TMP );
+    pthread_mutex_lock( &g_sdplay_info.ts_db_mutex );
+    if( stat(g_sdplay_info.ts_dbfile, &stat_buf) != 0 ) {
+        LOGE("get file %s stat error", g_sdplay_info.ts_dbfile );
+        pthread_mutex_unlock( &g_sdplay_info.ts_db_mutex );
         return -1;
     }
     if( stat_buf.st_size == 0 ) {
-        LOGE("file %s size is 0", db_file);
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
+        LOGE("file %s size is 0", g_sdplay_info.ts_dbfile);
+        pthread_mutex_unlock( &g_sdplay_info.ts_db_mutex );
         return -1;
     }
-    fp_old = fopen(db_file, "r");
+    fp_old = fopen(g_sdplay_info.ts_dbfile, "r");
     if ( !fp_old ) {
-        LOGE("open file %s error", db_file);
-        pthread_mutex_unlock( &g_sdplay_info.mutex );
+        LOGE("open file %s error", g_sdplay_info.ts_dbfile);
+        pthread_mutex_unlock( &g_sdplay_info.ts_db_mutex );
         return -1;
     }
     fp_new = fopen( new_db_file, "w");
@@ -377,9 +428,9 @@ static int remove_records_from_index_db()
     }
     fclose(fp_old);
     fclose(fp_new);
-    remove(db_file);
-    rename(new_db_file, db_file);
-    pthread_mutex_unlock( &g_sdplay_info.mutex );
+    remove(g_sdplay_info.ts_dbfile);
+    rename(new_db_file, g_sdplay_info.ts_dbfile);
+    pthread_mutex_unlock(&g_sdplay_info.ts_db_mutex);
     return 0;
 }
 
@@ -391,8 +442,7 @@ static int release_sd_space()
     size_t len = 0;
     char *line = NULL;
 
-    CALL( get_db_filename(db_file, sizeof(db_file)) );
-    if ( (fp = fopen(db_file, "r")) == NULL ) {
+    if ( (fp = fopen(g_sdplay_info.ts_dbfile, "r")) == NULL ) {
         LOGE("open file %s error", db_file );
         return -1;
     }
@@ -639,43 +689,12 @@ static int calc_ts_md5( uint8_t *inbuf, size_t inlen, char *outbuf )
     return 0;
 }
 
-static int gen_packet_header(
-        int pkt_idx, 
-        int endflg, 
-        int starttime, 
-        int endtime,
-        int len,
-        char *md5,
-        uint8_t *out_pkt_hdr )
+static inline FILE *open_ts_index_db(const char *mode)
 {
-#define PKT_HDR_APPEND_INT(val) *(uint32_t *)out_pkt_hdr = htonl(val); out_pkt_hdr += 4;
+    FILE *fp = fopen(g_sdplay_info.ts_dbfile, mode);
 
-    ASSERT(out_pkt_hdr);
-
-    PKT_HDR_APPEND_INT( pkt_idx );
-    PKT_HDR_APPEND_INT( endflg );
-    if (pkt_idx != 0 && endflg) {
-        PKT_HDR_APPEND_INT( endtime );
-    } else {
-        PKT_HDR_APPEND_INT( starttime );
-    }
-    PKT_HDR_APPEND_INT( len );
-    if (endflg) 
-        memcpy(out_pkt_hdr, md5, TS_MD5_LEN);
-
-    return 0;
-}
-
-
-static inline FILE *open_index_db(const char *mode)
-{
-    char db_file[256] = {0};
-    FILE *fp = NULL;
-
-    get_db_filename( db_file, sizeof(db_file));
-    fp = fopen(db_file, mode);
     if ( !fp ) {
-        LOGE("open file %s error", db_file);
+        LOGE("open file %s error", g_sdplay_info.ts_dbfile);
     }
     return fp;
 }
@@ -725,14 +744,20 @@ static int send_pkt(
         uint8_t *pkt,
         int pkt_len )
 {
-    uint8_t pkt_hdr[PKT_HDR_LEN] = {0};
     int i = 0;
+    tag_frame_header_t hdr;
 
-    CALL( gen_packet_header(pkt_idx, endflg, starttime, endtime, pkt_len, md5, pkt_hdr) );
-    for (i=0; i<g_sdplay_info.active_ch_num; i++) {
-        CALL( lst_send_data( ch, pkt_hdr, sizeof(pkt_hdr), pkt, pkt_len));
-    }
-    return 0;
+    hdr.index = pkt_idx;
+    hdr.endflag = endflg;
+    hdr.length = pkt_len;
+    if (pkt_idx > 0 && endflg)
+        hdr.utctime = endtime;
+    else
+        hdr.utctime = starttime;
+    if (endflg)
+        memcpy(hdr.md5_str, md5, TS_MD5_LEN);
+
+    return(lst_send_data(ch, (uint8_t *)&hdr, sizeof(hdr), pkt, pkt_len));
 }
 
 static int send_ts(int ch, const char *ts_file, int starttime, int endtime)
@@ -752,15 +777,15 @@ static int send_ts(int ch, const char *ts_file, int starttime, int endtime)
         goto err;
     pkt_count = filesize/MAX_PKT_SIZE;
     if (pkt_count == 1) {
-        if( send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize )<0)
+        if(send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize)<0)
             goto err;
     } else {
         for (i=0; i<pkt_count; i++) {
-            if( send_pkt(ch, i, 0, starttime, endtime, md5, buf_ptr, MAX_PKT_SIZE ) < 0 )
+            if(send_pkt(ch, i, 0, starttime, endtime, md5, buf_ptr, MAX_PKT_SIZE) < 0 )
                 goto err;
             buf_ptr += MAX_PKT_SIZE;
         }
-        if( send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize-(pkt_count*MAX_PKT_SIZE) ) < 0)
+        if(send_pkt(ch, i, 1, starttime, endtime, md5, buf_ptr, filesize-(pkt_count*MAX_PKT_SIZE)) < 0)
             goto err;
     }
 
@@ -775,80 +800,17 @@ err:
     return -1;
 }
 
-int sdp_send_ts_list(int ch, int starttime, int endtime)
-{
-    int start_pos = 0, end_pos = 0;
-    FILE *db_fp = NULL;
-    int count = 0, i = 0;
-    char *line = NULL;
-    size_t len = 0;
-    int ts_starttime = 0, ts_endtime = 0;
-    char db_file[256] = {0};
-
-    ASSERT( g_sdplay_info.ts_path );
-    ASSERT( endtime );
-
-    pthread_mutex_lock( &g_sdplay_info.mutex );
-    db_fp = open_index_db("r");
-    if ( !db_fp ) 
-        goto err;
-    if (get_db_filename(db_file, sizeof(db_file)) < 0)
-        goto err;
-    start_pos = find_start_pos(db_file, starttime);
-    if (start_pos < 0)
-        return -ERRINTERNAL;
-    LOGI("start:%d", start_pos);
-    end_pos = find_end_pos(db_file, endtime);
-    if (end_pos < 0)
-        return -ERRINTERNAL;
-    count = end_pos - start_pos + 1;
-    ASSERT( count );
-    for (i = 0; i < count; ++i) {
-        if ( getline( &line, &len, db_fp) < 0 ) {
-            LOGE("getline error");
-            free(line);
-            goto err;
-        }
-        if ( parse_one_record(line, &ts_starttime, &ts_endtime) < 0 )
-            goto err;
-        if( send_ts(ch, line, ts_starttime, ts_endtime) < 0 ) 
-            goto err;
-        free(line);
-    }
-    fclose( db_fp );
-    pthread_mutex_unlock( &g_sdplay_info.mutex );
-
-    return 0;
-
-err:
-    if (db_fp)
-        fclose(db_fp);
-    pthread_mutex_unlock( &g_sdplay_info.mutex );
-    return -1;
-}
-
-static inline int get_segment_db_filename( char *out_filename, int buflen )
-{
-    ASSERT( out_filename );
-    ASSERT( g_sdplay_info.ts_path );
-
-    snprintf( out_filename, buflen, "%s/%s", g_sdplay_info.ts_path, SEGMENT_DB_FILENAME );
-    return 0;
-}
-
 int sdp_save_segment_info(int starttime, int endtime)
 {
     FILE *fp = NULL;
-    char segment_db_file[256] = { 0 };
     char line[SEGMENT_RECORD_LEN] = {0};
 
     if (starttime < 0 || endtime < 0)
         return -ERRINVAL;
-    CALL( get_segment_db_filename( segment_db_file, sizeof(segment_db_file)) );
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
     snprintf(line, sizeof(line), "%" TIME_FILL_ZERO_LEN "d-%" TIME_FILL_ZERO_LEN "d\n", starttime, endtime );
-    if ( (fp = fopen( segment_db_file, "a") ) == NULL ) {
-        LOGE("open file %s error", segment_db_file);
+    if ( (fp = fopen(g_sdplay_info.segment_dbfile, "a") ) == NULL ) {
+        LOGE("open file %s error", g_sdplay_info.segment_dbfile);
         pthread_mutex_unlock(&g_sdplay_info.segment_db_mutex);
         return -1;
     }
@@ -860,7 +822,6 @@ int sdp_save_segment_info(int starttime, int endtime)
 
 int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
 {
-    char segment_db_file[256] = { 0 };
     FILE *fp = NULL;
     int start_pos = 0, end_pos = 0, count = 0;
     int starttime = 0, endtime = 0;
@@ -869,27 +830,24 @@ int sdp_send_segment_list(int ch, int in_starttime, int in_endtime)
     int record_len = 0, i = 0, total = 0, ret = -ERRINTERNAL;
     SMsgAVIoctrlListEventResp *eventlist = NULL;
 
-    if( get_segment_db_filename(segment_db_file, sizeof(segment_db_file)) <0)
-        return -ERRINTERNAL;
-
     pthread_mutex_lock(&g_sdplay_info.segment_db_mutex);
-    if ( get_record_info_in_db(segment_db_file, &record_len, &total) < 0 ) {
+    if ( get_record_info_in_db(g_sdplay_info.segment_dbfile, &record_len, &total) < 0 ) {
         LOGE("get record info error");
         goto err_unlock;
     }
     LOGI("total:%d", total);
     LOGI("in_starttime:%d", in_starttime);
     LOGI("in_endtime:%d", in_endtime);
-    start_pos = find_start_pos(segment_db_file, in_starttime);
+    start_pos = find_start_pos(g_sdplay_info.segment_dbfile, in_starttime);
     if (start_pos < 0)
         goto err_unlock;
     LOGI("start:%d", start_pos);
-    end_pos = find_end_pos(segment_db_file, in_endtime);
+    end_pos = find_end_pos(g_sdplay_info.segment_dbfile, in_endtime);
     if (end_pos < 0)
         goto err_unlock;
     LOGI("start:%d end:%d", start_pos, end_pos);
-    if ((fp = fopen(segment_db_file, "r") ) == NULL) {
-        LOGE("open file %s error", segment_db_file );
+    if ((fp = fopen(g_sdplay_info.segment_dbfile, "r") ) == NULL) {
+        LOGE("open file %s error", g_sdplay_info.segment_dbfile );
         goto err_close_file;
     }
     ASSERT(record_len);

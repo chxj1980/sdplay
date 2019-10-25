@@ -161,6 +161,9 @@ int lst_recv_ioctl( int ch, unsigned int *out_cmd, char *out_data, int max_size,
     if ( ret < 0 ) {
         if ( ret == AV_ER_TIMEOUT ) {
             return LST_ERR_TIMEOUT;
+        } else if (ret == AV_ER_SESSION_CLOSE_BY_REMOTE) {
+            LOGE("session closed by remote");
+            return LST_ERR_SESSION_CLOSE_BY_REMOTE;
         } else {
             LOGE("avRecvIOCtrl error, ret = %d", ret);
             return -1;
